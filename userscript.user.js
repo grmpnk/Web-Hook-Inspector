@@ -2,7 +2,7 @@
 // @name         Web Hook Inspector
 // @name:ja      Web Hook Inspector
 // @namespace    https://github.com/grmpnk
-// @version      0.1
+// @version      0.1.1
 // @description  Hook page functions and properties via checkboxes, and log the source, arguments, result, and stack trace to the console.
 // @description:ja  ページ上の関数・プロパティをチェックボックスで選んでフックし、呼び出し元・引数・戻り値・スタックをコンソールに記録します。
 // @author       grmpneko
@@ -87,8 +87,9 @@ const TARGETS = {
     Window: () => [w],
     original: () => [w]
 };
-const cfg = { hooks: {}, props: {}, logOnKey: false, key: '', rate: 10 };
+const cfg = { hooks: {}, props: {}, custom: { fn: [], prop: [] }, logOnKey: false, key: '', rate: 10 };
 const slots = new Map();
+const propSlots = new Map();
 const xhrMeta = new WeakMap();
 const rApply = Reflect.apply, rConstruct = Reflect.construct, fnToString = Function.prototype.toString;
 let held = false, sent = 0, stamp = 0, busy = false, panel = null;
@@ -147,8 +148,7 @@ const resolve = (group, name) => {
     }
     const real = ALIAS.get(name) ?? name;
     if(IFACE.has(group)) return iface(real);
-    if(group === 'other') return other(real);
-    if(!Object.hasOwn(TARGETS, group)) return [];
+    if(group === 'other' || !Object.hasOwn(TARGETS, group)) return other(real);
     return TARGETS[group]().filter(t => isFn(peek(t, real))).map(obj => ({ obj, key: real }));
 };
 
@@ -216,7 +216,7 @@ const extraFor = (obj, key) => {
 
 const side = (extra, info, phase) => {
     if(!extra) return;
-    try{ extra(info, phase); }catch{ info.phase = phase; }
+    try{ extra(info, phase); }catch{ return; }
 };
 
 const touch = (info, phase) => {
@@ -306,8 +306,6 @@ const unhook = id => silent(() => {
         }
     }
 });
-
-const propSlots = new Map();
 
 const propTargets = () => [w, w.Object.prototype, w.Array.prototype, w.Function.prototype];
 
@@ -403,10 +401,10 @@ const catalog = () => {
         if(!isFn(f) || known.has(n) || aliased.has(n)) continue;
         const g = !isNative(f) ? 'original'
             : /^HTML/.test(n) ? 'HTML'
-                : /^WebGL/.test(n) ? 'WebGL'
-                    : /Canvas/.test(n) ? 'Canvas'
-                        : /^[A-Z]/.test(n) ? 'Interface'
-                            : 'Window';
+            : /^WebGL/.test(n) ? 'WebGL'
+            : /Canvas/.test(n) ? 'Canvas'
+            : /^[A-Z]/.test(n) ? 'Interface'
+            : 'Window';
         (found[g] ??= []).push(n);
     }
     for(const [g, names] of Object.entries(found)) extend(g, names);
@@ -414,6 +412,73 @@ const catalog = () => {
 };
 
 const sumChecked = (c, pick) => Object.entries(c).reduce((t, [g, ns]) => t + ns.filter(n => pick(g, n)).length, 0);
+
+const globalPreview = v => {
+    if(Array.isArray(v)) return `Array(${v.length})`;
+    if(v !== null && typeof v === 'object') return v.constructor?.name ?? 'Object';
+    if(typeof v === 'string') return JSON.stringify(v.length > 80 ? `${v.slice(0, 80)}…` : v);
+    return String(v);
+};
+
+const globalCatalog = () => {
+    const cat = { Variable: [], Object: [], Array: [] };
+    for(const name of Object.getOwnPropertyNames(w).sort()){
+        let v, text;
+        try{ v = w[name]; }catch{ continue; }
+        if(isFn(v)) continue;
+        try{ text = globalPreview(v); }catch{ text = '(unreadable)'; }
+        const g = Array.isArray(v) ? 'Array' : (v !== null && typeof v === 'object') ? 'Object' : 'Variable';
+        cat[g].push([name, text]);
+    }
+    return cat;
+};
+
+const cell = (content, tagName = 'td') => {
+    const el = $C(tagName, {
+        styles: {
+            border: '1px solid #ccc', padding: '2px 6px', textAlign: 'left', verticalAlign: 'top',
+            wordBreak: 'break-all', background: tagName === 'th' ? '#f5f5f5' : ''
+        }
+    });
+    el.append(content);
+    return el;
+};
+
+const tableOf = (heads, rows) => {
+    const table = $C('table', { styles: { borderCollapse: 'collapse', width: '100%', font: '12px monospace' } });
+    for(const [cells, tagName] of [[heads, 'th'], ...rows.map(r => [r, 'td'])]){
+        const tr = $C('tr');
+        tr.append(...cells.map(c => cell(c, tagName)));
+        table.appendChild(tr);
+    }
+    return table;
+};
+
+const logGlobal = name => silent(() => {
+    try{ l(name, w[name]); }catch(e){ l(name, e); }
+});
+
+const nameCell = name => $C('span', {
+    props: { textContent: name },
+    attrs: { title: 'Click to log to console' },
+    styles: { cursor: 'pointer', color: '#06c', textDecoration: 'underline' },
+    on: { click: () => logGlobal(name) }
+});
+
+const renderGlobals = page => silent(() => {
+    page.replaceChildren();
+    for(const [group, items] of Object.entries(globalCatalog())){
+        const box = $C('details', { styles: { margin: '4px 0', border: '1px solid #ccc', borderRadius: '4px' } });
+        box.appendChild($C('summary', {
+            props: { textContent: `${group} (${items.length})` },
+            styles: { cursor: 'pointer', fontWeight: 'bold', background: '#eee', padding: '3px 6px' }
+        }));
+        const wrap = $C('div', { styles: { padding: '6px', overflowX: 'auto' } });
+        wrap.appendChild(tableOf(['Name', 'Value'], items.map(([name, text]) => [nameCell(name), text])));
+        box.appendChild(wrap);
+        page.appendChild(box);
+    }
+});
 
 const groupBox = (group, names, store, storeName, keyOf, apply, onChange) => {
     const box = $C('details', { styles: { margin: '4px 0', border: '1px solid #ccc', borderRadius: '4px' } });
@@ -449,26 +514,203 @@ const groupBox = (group, names, store, storeName, keyOf, apply, onChange) => {
     return box;
 };
 
-const resetAll = async () => {
-    for(const id of Object.keys(cfg.hooks)) unhook(id);
-    for(const name of [...propSlots.keys()]) unhookProp(name);
-    cfg.hooks = {};
-    cfg.props = {};
-    cfg.logOnKey = false;
-    cfg.key = '';
-    cfg.rate = 10;
-    held = false;
-    await Promise.all([
-        GM.setValue('fnHooks', {}),
-        GM.setValue('props', {}),
-        GM.setValue('logOnKey', false),
-        GM.setValue('logKey', ''),
-        GM.setValue('rate', 10)
-    ]);
+const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const cleanFlags = v => isObj(v) ? Object.fromEntries(Object.entries(v).filter(([, on]) => on === true)) : {};
+const cleanNames = v => Array.isArray(v) ? [...new Set(v.filter(n => typeof n === 'string' && n && !/\s/.test(n)))] : [];
+
+const normalize = data => {
+    const o = isObj(data) ? data : {};
+    const c = isObj(o.custom) ? o.custom : {};
+    return {
+        fnHooks: cleanFlags(o.fnHooks),
+        props: cleanFlags(o.props),
+        custom: { fn: cleanNames(c.fn), prop: cleanNames(c.prop) },
+        logOnKey: o.logOnKey === true,
+        logKey: typeof o.logKey === 'string' ? o.logKey : '',
+        rate: Number.isFinite(o.rate) && o.rate >= 0 ? Math.floor(o.rate) : 10
+    };
 };
 
-const buildPanel = propCat => silent(() => {
-    const cat = catalog();
+const loadSettings = async () => normalize({
+    fnHooks: await GM.getValue('fnHooks', {}),
+    props: await GM.getValue('props', {}),
+    custom: await GM.getValue('custom', {}),
+    logOnKey: await GM.getValue('logOnKey', false),
+    logKey: await GM.getValue('logKey', ''),
+    rate: await GM.getValue('rate', 10)
+});
+
+const storeSettings = s => Promise.all([
+    GM.setValue('fnHooks', s.fnHooks),
+    GM.setValue('props', s.props),
+    GM.setValue('custom', s.custom),
+    GM.setValue('logOnKey', s.logOnKey),
+    GM.setValue('logKey', s.logKey),
+    GM.setValue('rate', s.rate)
+]);
+
+const useSettings = s => {
+    cfg.hooks = s.fnHooks;
+    cfg.props = s.props;
+    cfg.custom = s.custom;
+    cfg.logOnKey = s.logOnKey;
+    cfg.key = s.logKey;
+    cfg.rate = s.rate;
+};
+
+const persist = () => storeSettings({
+    fnHooks: cfg.hooks, props: cfg.props, custom: cfg.custom, logOnKey: cfg.logOnKey, logKey: cfg.key, rate: cfg.rate
+});
+
+const rebuild = async tab => {
+    silent(() => $S('#uh-root')?.remove());
+    panel = propsReady.then(p => buildPanel(p, tab));
+    (await panel).style.display = 'flex';
+};
+
+const commit = async tab => {
+    await persist();
+    await rebuild(tab);
+};
+
+const unhookAll = () => {
+    for(const id of Object.keys(cfg.hooks)) unhook(id);
+    for(const name of [...propSlots.keys()]) unhookProp(name);
+};
+
+const hookAll = () => {
+    for(const id of Object.keys(cfg.hooks)) hook(id);
+    for(const name of Object.keys(cfg.props)) hookProp(name);
+};
+
+const resetAll = async () => {
+    unhookAll();
+    held = false;
+    useSettings(normalize({}));
+    await persist();
+};
+
+const exportSettings = async () => {
+    const text = JSON.stringify(await loadSettings(), null, 2);
+    silent(() => {
+        const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+        const a = $C('a', { attrs: { href: url, download: 'web-hook-inspector-settings.json' } });
+        d.documentElement.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+};
+
+const importSettings = async text => {
+    const s = silent(() => {
+        try{
+            const data = JSON.parse(text);
+            return isObj(data) ? normalize(data) : null;
+        }catch{
+            return null;
+        }
+    });
+    if(!s) return false;
+    unhookAll();
+    held = false;
+    useSettings(s);
+    await storeSettings(s);
+    hookAll();
+    return true;
+};
+
+const buildCustom = (page, baseProps) => {
+    let editing = null;
+    const flagsOf = type => type === 'fn' ? cfg.hooks : cfg.props;
+    const keyOf = (type, name) => type === 'fn' ? `Custom.${name}` : name;
+    const sharedProp = name => Object.values(baseProps).some(ns => ns.includes(name));
+    const typeSel = $C('select');
+    typeSel.append(
+        $C('option', { attrs: { value: 'fn' }, props: { textContent: 'Functions (Tab A)' } }),
+        $C('option', { attrs: { value: 'prop' }, props: { textContent: 'Properties (Tab B)' } })
+    );
+    const nameIn = $C('input', { attrs: { type: 'text', placeholder: 'name' }, styles: { width: '220px' } });
+    const msg = $C('span', { styles: { color: '#c00' } });
+    const clear = () => {
+        editing = null;
+        nameIn.value = '';
+        msg.textContent = '';
+        submitBtn.textContent = 'Add';
+        cancelBtn.style.display = 'none';
+    };
+    const drop = (type, name) => {
+        cfg.custom[type] = cfg.custom[type].filter(n => n !== name);
+        if(type === 'prop' && sharedProp(name)) return false;
+        const key = keyOf(type, name), flags = flagsOf(type), on = !!flags[key];
+        if(type === 'fn') unhook(key); else unhookProp(key);
+        delete flags[key];
+        return on;
+    };
+    const submit = async () => {
+        const type = typeSel.value, name = nameIn.value.trim();
+        if(!name){
+            msg.textContent = 'Name is required.';
+            return;
+        }
+        if(/\s/.test(name)){
+            msg.textContent = 'Name must not contain spaces.';
+            return;
+        }
+        const same = editing && editing.type === type && editing.name === name;
+        if(!same && (cfg.custom[type].includes(name) || (type === 'prop' && sharedProp(name)))){
+            msg.textContent = 'Already listed.';
+            return;
+        }
+        const on = editing ? drop(editing.type, editing.name) : false;
+        cfg.custom[type].push(name);
+        if(on){
+            const key = keyOf(type, name);
+            flagsOf(type)[key] = true;
+            if(type === 'fn') hook(key); else hookProp(key);
+        }
+        await commit(3);
+    };
+    const submitBtn = $C('button', { props: { textContent: 'Add' }, styles: { cursor: 'pointer' }, on: { click: submit } });
+    const cancelBtn = $C('button', { props: { textContent: 'Cancel' }, styles: { cursor: 'pointer', display: 'none' }, on: { click: clear } });
+    const form = $C('div', { styles: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center', marginBottom: '8px' } });
+    form.append(typeSel, nameIn, submitBtn, cancelBtn, msg);
+    const rows = [];
+    for(const type of ['fn', 'prop']){
+        for(const name of cfg.custom[type]){
+            const actions = $C('span', { styles: { display: 'flex', gap: '4px' } });
+            actions.append(
+                $C('button', {
+                    props: { textContent: 'Edit' },
+                    styles: { cursor: 'pointer' },
+                    on: {
+                        click: () => {
+                            editing = { type, name };
+                            typeSel.value = type;
+                            nameIn.value = name;
+                            msg.textContent = '';
+                            submitBtn.textContent = 'Save';
+                            cancelBtn.style.display = '';
+                        }
+                    }
+                }),
+                $C('button', {
+                    props: { textContent: 'Delete' },
+                    styles: { cursor: 'pointer' },
+                    on: { click: async () => { drop(type, name); await commit(3); } }
+                })
+            );
+            rows.push([type === 'fn' ? 'Functions' : 'Properties', name, actions]);
+        }
+    }
+    page.append(form, rows.length ? tableOf(['Target', 'Name', ''], rows) : 'No custom entries.');
+};
+
+const buildPanel = (baseProps, tab = 0) => silent(() => {
+    const base = Object.fromEntries(Object.entries(baseProps).filter(([g]) => g !== 'Custom'));
+    const cat = { Custom: cfg.custom.fn.slice(), ...catalog() };
+    const propCat = { Custom: cfg.custom.prop.slice(), ...base };
+    let current = tab;
     const root = $C('div', {
         attrs: { id: 'uh-root' },
         styles: {
@@ -479,21 +721,32 @@ const buildPanel = propCat => silent(() => {
     });
     const pageA = $C('div');
     const pageB = $C('div');
-    const pages = [pageA, pageB];
-    const buttons = ['Functions', 'Properties'].map((text, i) => $C('button', {
+    const pageC = $C('div');
+    const pageD = $C('div');
+    const pages = [pageA, pageB, pageC, pageD];
+    const buttons = ['Functions', 'Properties', 'Globals', 'Custom'].map((text, i) => $C('button', {
         props: { textContent: text },
         styles: { cursor: 'pointer' },
         on: { click: () => show(i) }
     }));
     const show = i => {
+        current = i;
         pages.forEach((p, j) => {
             p.style.display = i === j ? 'block' : 'none';
             buttons[j].style.fontWeight = i === j ? 'bold' : 'normal';
         });
+        if(i === 2) renderGlobals(pageC);
     };
     const tally = () => {
         buttons[0].textContent = `Functions (${sumChecked(cat, (g, n) => cfg.hooks[`${g}.${n}`])})`;
         buttons[1].textContent = `Properties (${sumChecked(propCat, (g, n) => cfg.props[n])})`;
+    };
+    const fillGroups = (page, groups, store, storeName, keyOf, apply) => {
+        for(const [group, names] of Object.entries(groups)){
+            if(!names.length && group !== 'Custom') continue;
+            const box = groupBox(group, names, store, storeName, n => keyOf(group, n), apply, tally);
+            page.appendChild(box);
+        }
     };
     const close = $C('button', {
         props: { textContent: '×' },
@@ -507,17 +760,12 @@ const buildPanel = propCat => silent(() => {
         }
     });
     head.append($C('b', { props: { textContent: 'Hook Manager' } }), ...buttons, close);
-    for(const [group, names] of Object.entries(cat)){
-        if(!names.length) continue;
-        pageA.appendChild(groupBox(group, names, cfg.hooks, 'fnHooks', n => `${group}.${n}`, (id, on) => { if(on) hook(id); else unhook(id); }, tally));
-    }
-    for(const [group, names] of Object.entries(propCat)){
-        if(!names.length) continue;
-        pageB.appendChild(groupBox(group, names, cfg.props, 'props', n => n, (k, on) => { if(on) hookProp(k); else unhookProp(k); }, tally));
-    }
+    fillGroups(pageA, cat, cfg.hooks, 'fnHooks', (g, n) => `${g}.${n}`, (id, on) => { if(on) hook(id); else unhook(id); });
+    fillGroups(pageB, propCat, cfg.props, 'props', (g, n) => n, (k, on) => { if(on) hookProp(k); else unhookProp(k); });
+    buildCustom(pageD, base);
     const body = $C('div', { styles: { overflowY: 'auto', padding: '6px', flex: '1' } });
-    body.append(pageA, pageB);
-    show(0);
+    body.append(pageA, pageB, pageC, pageD);
+    show(tab);
     tally();
     const footer = $C('div', {
         styles: { borderTop: '1px solid #888', padding: '8px 10px', display: 'flex', flexWrap: 'wrap', gap: '16px', alignItems: 'center' }
@@ -565,19 +813,43 @@ const buildPanel = propCat => silent(() => {
         }
     });
     rateLabel.append('Max logs / sec: ', rateInput);
-    const reset = $C('button', {
-        props: { textContent: 'Reset' },
-        styles: { cursor: 'pointer', marginLeft: 'auto' },
+    const status = $C('span', { styles: { color: '#c00' } });
+    const fileIn = $C('input', {
+        attrs: { type: 'file', accept: '.json,application/json' },
+        styles: { display: 'none' },
         on: {
-            click: async () => {
-                await resetAll();
-                root.remove();
-                panel = null;
-                togglePanel();
+            change: async () => {
+                const file = fileIn.files[0];
+                fileIn.value = '';
+                if(!file) return;
+                if(await importSettings(await file.text())) await rebuild(current);
+                else status.textContent = 'Import failed: invalid settings file.';
             }
         }
     });
-    footer.append(keyLabel, rateLabel, reset);
+    const importBtn = $C('button', {
+        props: { textContent: 'Import' },
+        styles: { cursor: 'pointer' },
+        on: { click: () => silent(() => fileIn.click()) }
+    });
+    const exportBtn = $C('button', {
+        props: { textContent: 'Export' },
+        styles: { cursor: 'pointer' },
+        on: { click: exportSettings }
+    });
+    const reset = $C('button', {
+        props: { textContent: 'Reset' },
+        styles: { cursor: 'pointer' },
+        on: {
+            click: async () => {
+                await resetAll();
+                await rebuild(current);
+            }
+        }
+    });
+    const actions = $C('div', { styles: { marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' } });
+    actions.append(status, importBtn, exportBtn, reset, fileIn);
+    footer.append(keyLabel, rateLabel, actions);
     root.append(head, body, footer);
     d.documentElement.appendChild(root);
     return root;
@@ -590,22 +862,13 @@ const togglePanel = async () => {
 };
 
 (async () => {
-    cfg.hooks = await GM.getValue('fnHooks', {});
-    cfg.props = await GM.getValue('props', {});
-    cfg.logOnKey = await GM.getValue('logOnKey', false);
-    cfg.key = await GM.getValue('logKey', '');
-    cfg.rate = await GM.getValue('rate', 10);
+    useSettings(await loadSettings());
     Object.defineProperty(w, '__orig', { value: null, writable: true, configurable: true, enumerable: false });
-
     d.addEventListener('keydown', e => { if(e.key === cfg.key) held = true; }, true);
     d.addEventListener('keyup', e => { if(e.key === cfg.key) held = false; }, true);
     addEventListener('blur', () => { held = false; });
-    const applyAll = () => {
-        for(const id of Object.keys(cfg.hooks)) hook(id);
-        for(const name of Object.keys(cfg.props)) hookProp(name);
-    };
-    d.addEventListener('DOMContentLoaded', applyAll);
-    addEventListener('load', applyAll);
+    d.addEventListener('DOMContentLoaded', hookAll);
+    addEventListener('load', hookAll);
     GM_registerMenuCommand('Hook Manager', togglePanel);
-    applyAll();
+    hookAll();
 })();
