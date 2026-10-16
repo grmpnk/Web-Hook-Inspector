@@ -1,3 +1,4 @@
 {
-  "test": ["Game","cookie","login"]
+  "fnHooks ": ["Game.Has","Game[\"Has\"]"],
+  "fnHooks ": ["Game","cookie"]
 }
