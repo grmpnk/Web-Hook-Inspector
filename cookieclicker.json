@@ -1,4 +1,3 @@
 {
-  "fnHooks": ["Game.Has"],
-  "props": ["Game","cookie"]
+  "fnHooks": ["Game.Has"]
 }
