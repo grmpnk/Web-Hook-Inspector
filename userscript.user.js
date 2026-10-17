@@ -2,7 +2,7 @@
 // @name         Web Hook Inspector
 // @name:ja      Web Hook Inspector
 // @namespace    https://github.com/grmpnk
-// @version      0.1.1
+// @version      0.1.2
 // @description  Hook page functions and properties via checkboxes, and log the source, arguments, result, and stack trace to the console.
 // @description:ja  ページ上の関数・プロパティをチェックボックスで選んでフックし、呼び出し元・引数・戻り値・スタックをコンソールに記録します。
 // @author       grmpneko
@@ -24,8 +24,7 @@ let w=typeof unsafeWindow!=='undefined'?unsafeWindow:window,d=document,l=console
 // ==========================================
 // Main
 // ==========================================
-const JSON_URLS = [
-];
+const JSON_URLS = [];
 const PREPOP = {
     other: [
         'XHR', 'fetch', 'WebSocket', 'JSON', 'Worker', 'requestIdleCallback', 'setInterval', 'setTimeout', 'clearInterval', 'clearTimeout', 'Event', 'Response',
@@ -63,6 +62,7 @@ const PREPOP = {
         'log1p', 'log2', 'log10', 'max', 'min', 'pow', 'random', 'round', 'sign', 'sin', 'sinh', 'sqrt', 'sumPrecise', 'tan', 'tanh', 'trunc'
     ]
 };
+
 const PROPS = {
     login: ['login', 'isLoggedIn', 'isLogin', 'loginStatus', 'loginState', 'loginFlag', 'loginSession'],
     mail: ['email', 'userEmail', 'emailAddress', 'isEmailValid', 'emailValid']
@@ -72,6 +72,7 @@ const ALIAS = new Map([
     ['PropDescriptor', 'getOwnPropertyDescriptor'], ['PropDescriptors', 'getOwnPropertyDescriptors'],
     ['PropNames', 'getOwnPropertyNames'], ['PropSymbols', 'getOwnPropertySymbols']
 ]);
+
 const aliased = new Set(ALIAS.values());
 const IFACE = new Set(['HTML', 'Canvas', 'WebGL', 'Interface']);
 const TARGETS = {
@@ -87,19 +88,21 @@ const TARGETS = {
     Window: () => [w],
     original: () => [w]
 };
-const cfg = { hooks: {}, props: {}, custom: { fn: [], prop: [] }, logOnKey: false, key: '', rate: 10 };
+
+const dict = () => Object.create(null);
+const cfg = { hooks: dict(), props: dict(), custom: { fn: [], prop: [] }, overrides: [], logOnKey: false, key: '', rate: 10 };
 const slots = new Map();
 const propSlots = new Map();
 const xhrMeta = new WeakMap();
+const remote = { urls: [], data: {} };
+const compiled = new Map();
 const rApply = Reflect.apply, rConstruct = Reflect.construct, fnToString = Function.prototype.toString;
 let held = false, sent = 0, stamp = 0, busy = false, panel = null;
-
 const silent = fn => {
     const prev = busy;
     busy = true;
     try{ return fn(); }finally{ busy = prev; }
 };
-
 const own = (o, k) => Object.getOwnPropertyDescriptor(o, k);
 const isFn = v => typeof v === 'function';
 const peek = (o, k) => {
@@ -110,12 +113,10 @@ const fnNames = o => Object.getOwnPropertyNames(o).filter(k => k !== 'constructo
 const ownFns = o => fnNames(o).map(key => ({ obj: o, key }));
 const isNative = f => /\[native code\]/.test(rApply(fnToString, f, []));
 const tag = (id, key) => id.endsWith(`.${key}`) ? id : `${id} › ${key}`;
-
 const isCustomEvent = a => {
     const t = typeof a[0] === 'string' ? a[0] : a[0]?.type;
     return typeof t === 'string' && !(`on${t}` in w) && !(`on${t}` in d);
 };
-
 const members = o => {
     const out = [];
     for(let p = o; p && p !== w.Object.prototype; p = Object.getPrototypeOf(p)){
@@ -123,16 +124,14 @@ const members = o => {
     }
     return out;
 };
-
 const iface = name => {
     const c = peek(w, name);
     return isFn(c) && c.prototype ? ownFns(c.prototype) : [];
 };
-
 const other = name => {
     const c = peek(w, name);
     if(isFn(c)){
-        const extra = /^[A-Z]/.test(name) ? [...(c.prototype ? ownFns(c.prototype) : []), ...ownFns(c)] : [];
+        const extra = /^[A-Z]/.test(name) && name !== 'Worker' ? [...(c.prototype ? ownFns(c.prototype) : []), ...ownFns(c)] : [];
         return [{ obj: w, key: name }, ...extra];
     }
     if(isFn(peek(w.Function.prototype, name))) return [{ obj: w.Function.prototype, key: name }];
@@ -141,17 +140,41 @@ const other = name => {
     if(v && typeof v === 'object') return members(v);
     return Object.getOwnPropertyNames(w).filter(k => k.startsWith(name) && isFn(peek(w, k))).flatMap(k => iface(k));
 };
-
+const parsePath = s => {
+    const out = [], re = /\.?([^.\[\]]+)|\[\s*(?:"([^"]*)"|'([^']*)'|(\d+))\s*\]/g;
+    let m, end = 0;
+    while((m = re.exec(s))){
+        if(m.index !== end) return null;
+        end = re.lastIndex;
+        out.push(m[1] ?? m[2] ?? m[3] ?? m[4]);
+    }
+    return end === s.length && out.length ? out : null;
+};
+const pathOwner = path => {
+    let o = w;
+    for(const k of path.slice(0, -1)){
+        try{ o = o[k]; }catch{ return []; }
+        if(o === null || (typeof o !== 'object' && !isFn(o))) return [];
+    }
+    const key = path[path.length - 1];
+    for(let p = o; p && p !== w.Object.prototype; p = Object.getPrototypeOf(p)){
+        if(isFn(peek(p, key))) return [{ obj: p, key }];
+    }
+    return [];
+};
+const viaPath = name => {
+    const path = parsePath(name);
+    return path && path.length > 1 ? pathOwner(path) : other(path ? path[0] : name);
+};
 const resolve = (group, name) => {
     if(group === 'Event' && name === 'originalEvent'){
         return ['addEventListener', 'removeEventListener', 'dispatchEvent'].map(key => ({ obj: w.EventTarget.prototype, key, filter: isCustomEvent }));
     }
     const real = ALIAS.get(name) ?? name;
     if(IFACE.has(group)) return iface(real);
-    if(group === 'other' || !Object.hasOwn(TARGETS, group)) return other(real);
+    if(group === 'other' || !Object.hasOwn(TARGETS, group)) return viaPath(real);
     return TARGETS[group]().filter(t => isFn(peek(t, real))).map(obj => ({ obj, key: real }));
 };
-
 const canLog = () => {
     if(cfg.logOnKey && !held) return false;
     if(cfg.rate === 0) return true;
@@ -161,19 +184,16 @@ const canLog = () => {
     sent++;
     return true;
 };
-
 const emit = (label, values, stack) => {
     if(!canLog()) return;
     console.groupCollapsed(label, ...values);
     l(stack ?? (new Error()).stack);
     console.groupEnd();
 };
-
 const xhrOpen = (info, phase) => {
     if(phase !== 'after') return;
     xhrMeta.set(info.source, { method: info.args[0], url: String(info.args[1]) });
 };
-
 const xhrSend = (info, phase) => {
     if(phase !== 'before') return;
     const xhr = info.source, stack = (new Error()).stack;
@@ -184,7 +204,6 @@ const xhrSend = (info, phase) => {
         emit('XHR done', [{ method: meta?.method, url: meta?.url, status: xhr.status, response }], stack);
     }), { once: true });
 };
-
 const fetchParsed = (info, phase) => {
     const p = info.result;
     if(phase !== 'after' || !p || !isFn(p.then)) return;
@@ -198,47 +217,87 @@ const fetchParsed = (info, phase) => {
         }));
     }), () => {}).catch(() => {});
 };
-
 const socketMessage = (info, phase) => {
     const ws = info.result;
     if(phase !== 'after' || !ws || !isFn(ws.addEventListener)) return;
     const stack = (new Error()).stack;
     ws.addEventListener('message', e => silent(() => emit('WebSocket message', ['url:', ws.url, 'data:', e.data, 'event:', e], stack)));
 };
-
+const workerSpawn = (info, phase) => {
+    const worker = info.result;
+    if(phase !== 'after' || !worker || !isFn(worker.postMessage)) return;
+    const post = worker.postMessage;
+    worker.postMessage = function(...args){
+        const slot = slots.get(w)?.get('Worker');
+        if(!slot) return rApply(post, this, args);
+        return traced(
+            () => {
+                const ids = [...slot.ids.keys()];
+                return { label: ids.map(id => tag(id, 'postMessage')).join(' | '), keys: ids.map(id => `fn:${id}`) };
+            },
+            this,
+            args,
+            (a, s) => rApply(post, s, a)
+        );
+    };
+};
 const extraFor = (obj, key) => {
     if(obj === w.XMLHttpRequest?.prototype && key === 'open') return xhrOpen;
     if(obj === w.XMLHttpRequest?.prototype && key === 'send') return xhrSend;
     if(obj === w && key === 'fetch') return fetchParsed;
     if(obj === w && key === 'WebSocket') return socketMessage;
+    if(obj === w && key === 'Worker') return workerSpawn;
     return null;
 };
-
 const side = (extra, info, phase) => {
     if(!extra) return;
     try{ extra(info, phase); }catch{ return; }
 };
-
+const compile = code => {
+    if(!compiled.has(code)){
+        let fn = null;
+        try{ fn = new Function('source', 'args', 'result', 'w', `${code}\n;return [source, args, result];`); }catch{ fn = null; }
+        compiled.set(code, fn);
+    }
+    return compiled.get(code);
+};
+const override = (info, phase) => {
+    for(const o of cfg.overrides){
+        if(o.phase !== phase || !info.keys.includes(o.key)) continue;
+        const fn = compile(o.code);
+        if(!fn) continue;
+        try{
+            const [source, args, result] = rApply(fn, null, [info.source, info.args, info.result, w]);
+            if(info.source !== null) info.source = source;
+            info.args = Array.isArray(args) ? args : [args];
+            if(phase === 'after') info.result = result;
+        }catch{
+            continue;
+        }
+    }
+};
 const touch = (info, phase) => {
+    override(info, phase);
     if(!isFn(w.__rewrite)) return;
     const args = info.args;
     info.phase = phase;
     try{ rApply(w.__rewrite, null, [info]); }catch{ info.args = args; }
     if(!Array.isArray(info.args)) info.args = args;
 };
-
-const traced = (labelOf, source, args, call, extra) => {
-    if(busy) return call(args);
-    const info = { label: '', source, args, result: undefined, threw: false, phase: '' };
+const traced = (describe, source, args, call, extra) => {
+    if(busy) return call(args, source);
+    const info = { label: '', keys: [], source, args, result: undefined, threw: false, phase: '' };
     silent(() => {
-        info.label = labelOf(args);
+        const desc = describe(args);
+        info.label = desc.label;
+        info.keys = desc.keys;
         if(!info.label) return;
         w.__orig = source;
         touch(info, 'before');
         side(extra, info, 'before');
     });
     try{
-        info.result = call(info.args);
+        info.result = call(info.args, info.source);
     }catch(e){
         info.threw = true;
         info.result = e;
@@ -255,15 +314,23 @@ const traced = (labelOf, source, args, call, extra) => {
     if(info.threw) throw info.result;
     return info.result;
 };
-
 const invoke = (slot, th, args, nt) => traced(
-    a => [...slot.ids].filter(([, f]) => !f || f(a)).map(([id]) => tag(id, slot.key)).join(' | '),
+    a => {
+        const ids = [...slot.ids].filter(([, f]) => !f || f(a)).map(([id]) => id);
+        return { label: ids.map(id => tag(id, slot.key)).join(' | '), keys: ids.map(id => `fn:${id}`) };
+    },
     nt ? null : th,
     args,
-    a => nt ? rConstruct(slot.orig, a, nt) : rApply(slot.orig, th, a),
+    (a, s) => nt ? rConstruct(slot.orig, a, nt) : rApply(slot.orig, s, a),
     slot.extra
 );
-
+const workerGlobal = s => {
+    const wrapped = function(url, options){
+        return invoke(s, null, [url, options], new.target);
+    };
+    wrapped.prototype = s.orig.prototype;
+    return wrapped;
+};
 const install = (obj, key, id, filter) => {
     let keys = slots.get(obj);
     if(!keys){
@@ -276,7 +343,7 @@ const install = (obj, key, id, filter) => {
         if(!desc || !isFn(desc.value)) return;
         slot = { desc, orig: desc.value, ids: new Map(), key, extra: extraFor(obj, key) };
         const s = slot;
-        slot.proxy = new Proxy(s.orig, {
+        slot.proxy = obj === w && key === 'Worker' ? workerGlobal(s) : new Proxy(s.orig, {
             apply: (t, th, a) => invoke(s, th, a, null),
             construct: (t, a, nt) => invoke(s, null, a, nt)
         });
@@ -289,12 +356,10 @@ const install = (obj, key, id, filter) => {
     }
     slot.ids.set(id, filter);
 };
-
 const hook = id => silent(() => {
     const i = id.indexOf('.');
     for(const e of resolve(id.slice(0, i), id.slice(i + 1))) install(e.obj, e.key, id, e.filter);
 });
-
 const unhook = id => silent(() => {
     for(const [obj, keys] of slots){
         for(const [key, slot] of keys){
@@ -306,9 +371,7 @@ const unhook = id => silent(() => {
         }
     }
 });
-
 const propTargets = () => [w, w.Object.prototype, w.Array.prototype, w.Function.prototype];
-
 const hookProp = name => silent(() => {
     if(propSlots.has(name)) return;
     const list = [];
@@ -322,16 +385,16 @@ const hookProp = name => silent(() => {
                 configurable: true, enumerable: false,
                 get(){
                     const k = keyOf(this);
-                    return traced(() => `get "${name}"`, this, [], () => {
+                    return traced(() => ({ label: `get "${name}"`, keys: [`prop:${name}`] }), this, [], (a, s) => {
                         if(values.has(k)) return values.get(k);
                         if(!prev) return undefined;
-                        return prev.get ? rApply(prev.get, this, []) : prev.value;
+                        return prev.get ? rApply(prev.get, s, []) : prev.value;
                     });
                 },
                 set(v){
                     const k = keyOf(this);
-                    traced(() => `set "${name}"`, this, [v], a => {
-                        if(prev?.set && !values.has(k)) return rApply(prev.set, this, a);
+                    traced(() => ({ label: `set "${name}"`, keys: [`prop:${name}`] }), this, [v], (a, s) => {
+                        if(prev?.set && !values.has(k)) return rApply(prev.set, s, a);
                         values.set(k, a[0]);
                     });
                 }
@@ -343,14 +406,12 @@ const hookProp = name => silent(() => {
     }
     propSlots.set(name, list);
 });
-
 const unhookProp = name => silent(() => {
     for(const { obj, prev } of propSlots.get(name) ?? []){
         if(prev) Object.defineProperty(obj, name, prev); else Reflect.deleteProperty(obj, name);
     }
     propSlots.delete(name);
 });
-
 const fetchJson = url => new Promise(resolveJson => {
     GM_xmlhttpRequest({
         method: 'GET',
@@ -363,24 +424,57 @@ const fetchJson = url => new Promise(resolveJson => {
         ontimeout: () => resolveJson(null)
     });
 });
-
-const loadProps = async () => {
-    const cat = Object.create(null);
-    for(const [g, names] of Object.entries(PROPS)) cat[g] = names.slice();
-    for(const data of await Promise.all(JSON_URLS.map(fetchJson))){
-        if(!data || typeof data !== 'object') continue;
-        for(const [g, names] of Object.entries(data)){
-            if(!Array.isArray(names)) continue;
-            cat[g] = [...new Set([...(cat[g] ?? []), ...names.filter(n => typeof n === 'string')])];
+const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const cleanFlags = v => {
+    const out = dict();
+    if(isObj(v)){
+        for(const [k, on] of Object.entries(v)){
+            if(on === true) out[k] = true;
         }
     }
-    return cat;
+    return out;
 };
-
-const propsReady = loadProps();
-
+const cleanNames = v => Array.isArray(v) ? [...new Set(v.filter(n => typeof n === 'string' && n && !/\s/.test(n)))] : [];
+const cleanOverrides = v => Array.isArray(v)
+    ? v.filter(o => isObj(o) && typeof o.key === 'string' && /^(fn|prop):./.test(o.key) && (o.phase === 'before' || o.phase === 'after') && typeof o.code === 'string' && o.code.trim())
+        .map(o => ({ key: o.key, phase: o.phase, code: o.code }))
+    : [];
+const groupOf = url => url.split(/[?#]/)[0].split('/').pop().replace(/\.[^.]*$/, '').replace(/\./g, '') || 'json';
+const cleanGroups = (v, name) => {
+    const out = dict();
+    const src = Array.isArray(v) ? { [name]: v } : v;
+    if(!isObj(src)) return out;
+    for(const [g, ns] of Object.entries(src)){
+        const names = cleanNames(ns);
+        if(g !== 'Custom' && !g.includes('.') && names.length) out[g] = names;
+    }
+    return out;
+};
+const normalizeRemote = (data, url) => {
+    const g = groupOf(url);
+    return { fnHooks: cleanGroups(data?.fnHooks, g), props: cleanGroups(data?.props, g) };
+};
+const mergeGroups = (...srcs) => {
+    const out = dict();
+    for(const src of srcs){
+        for(const [g, ns] of Object.entries(src)) out[g] = [...new Set([...(out[g] ?? []), ...ns])];
+    }
+    return out;
+};
+const remoteGroups = kind => mergeGroups(...Object.values(remote.data).map(x => x[kind]));
+const saveRemote = () => Promise.all([GM.setValue('jsonUrls', remote.urls), GM.setValue('jsonData', remote.data)]);
+const loadRemote = async () => {
+    const stored = await GM.getValue('jsonUrls', null);
+    const cached = await GM.getValue('jsonData', {});
+    remote.urls = Array.isArray(stored) ? [...new Set(stored.filter(u => typeof u === 'string' && u))] : JSON_URLS.slice();
+    const fetched = await Promise.all(remote.urls.map(fetchJson));
+    remote.urls.forEach((u, i) => {
+        remote.data[u] = normalizeRemote(fetched[i] ?? (isObj(cached) ? cached[u] : null), u);
+    });
+    await saveRemote();
+};
 const catalog = () => {
-    const cat = {};
+    const cat = dict();
     for(const [g, names] of Object.entries(PREPOP)) cat[g] = names.slice();
     const extend = (g, names) => {
         cat[g] = [...new Set([...(cat[g] ?? []), ...names.sort()])];
@@ -395,31 +489,28 @@ const catalog = () => {
     extend('Node', fnNames(w.Node.prototype).filter(n => !dom.has(n)));
     extend('Document', fnNames(w.Document.prototype).filter(n => !dom.has(n)));
     const known = new Set(Object.values(PREPOP).flat());
-    const found = {};
+    const found = dict();
     for(const n of Object.getOwnPropertyNames(w)){
         const f = peek(w, n);
         if(!isFn(f) || known.has(n) || aliased.has(n)) continue;
         const g = !isNative(f) ? 'original'
-            : /^HTML/.test(n) ? 'HTML'
-            : /^WebGL/.test(n) ? 'WebGL'
-            : /Canvas/.test(n) ? 'Canvas'
-            : /^[A-Z]/.test(n) ? 'Interface'
-            : 'Window';
+: /^HTML/.test(n) ? 'HTML'
+: /^WebGL/.test(n) ? 'WebGL'
+: /Canvas/.test(n) ? 'Canvas'
+: /^[A-Z]/.test(n) ? 'Interface'
+: 'Window';
         (found[g] ??= []).push(n);
     }
     for(const [g, names] of Object.entries(found)) extend(g, names);
     return cat;
 };
-
 const sumChecked = (c, pick) => Object.entries(c).reduce((t, [g, ns]) => t + ns.filter(n => pick(g, n)).length, 0);
-
 const globalPreview = v => {
     if(Array.isArray(v)) return `Array(${v.length})`;
     if(v !== null && typeof v === 'object') return v.constructor?.name ?? 'Object';
     if(typeof v === 'string') return JSON.stringify(v.length > 80 ? `${v.slice(0, 80)}…` : v);
     return String(v);
 };
-
 const globalCatalog = () => {
     const cat = { Variable: [], Object: [], Array: [] };
     for(const name of Object.getOwnPropertyNames(w).sort()){
@@ -432,7 +523,6 @@ const globalCatalog = () => {
     }
     return cat;
 };
-
 const cell = (content, tagName = 'td') => {
     const el = $C(tagName, {
         styles: {
@@ -443,7 +533,6 @@ const cell = (content, tagName = 'td') => {
     el.append(content);
     return el;
 };
-
 const tableOf = (heads, rows) => {
     const table = $C('table', { styles: { borderCollapse: 'collapse', width: '100%', font: '12px monospace' } });
     for(const [cells, tagName] of [[heads, 'th'], ...rows.map(r => [r, 'td'])]){
@@ -453,18 +542,15 @@ const tableOf = (heads, rows) => {
     }
     return table;
 };
-
 const logGlobal = name => silent(() => {
     try{ l(name, w[name]); }catch(e){ l(name, e); }
 });
-
 const nameCell = name => $C('span', {
     props: { textContent: name },
     attrs: { title: 'Click to log to console' },
     styles: { cursor: 'pointer', color: '#06c', textDecoration: 'underline' },
     on: { click: () => logGlobal(name) }
 });
-
 const renderGlobals = page => silent(() => {
     page.replaceChildren();
     for(const [group, items] of Object.entries(globalCatalog())){
@@ -479,7 +565,6 @@ const renderGlobals = page => silent(() => {
         page.appendChild(box);
     }
 });
-
 const groupBox = (group, names, store, storeName, keyOf, apply, onChange) => {
     const box = $C('details', { styles: { margin: '4px 0', border: '1px solid #ccc', borderRadius: '4px' } });
     const head = $C('summary', { styles: { cursor: 'pointer', fontWeight: 'bold', background: '#eee', padding: '3px 6px' } });
@@ -513,11 +598,6 @@ const groupBox = (group, names, store, storeName, keyOf, apply, onChange) => {
     refresh();
     return box;
 };
-
-const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
-const cleanFlags = v => isObj(v) ? Object.fromEntries(Object.entries(v).filter(([, on]) => on === true)) : {};
-const cleanNames = v => Array.isArray(v) ? [...new Set(v.filter(n => typeof n === 'string' && n && !/\s/.test(n)))] : [];
-
 const normalize = data => {
     const o = isObj(data) ? data : {};
     const c = isObj(o.custom) ? o.custom : {};
@@ -525,71 +605,65 @@ const normalize = data => {
         fnHooks: cleanFlags(o.fnHooks),
         props: cleanFlags(o.props),
         custom: { fn: cleanNames(c.fn), prop: cleanNames(c.prop) },
+        overrides: cleanOverrides(o.overrides),
         logOnKey: o.logOnKey === true,
         logKey: typeof o.logKey === 'string' ? o.logKey : '',
         rate: Number.isFinite(o.rate) && o.rate >= 0 ? Math.floor(o.rate) : 10
     };
 };
-
 const loadSettings = async () => normalize({
     fnHooks: await GM.getValue('fnHooks', {}),
     props: await GM.getValue('props', {}),
     custom: await GM.getValue('custom', {}),
+    overrides: await GM.getValue('overrides', []),
     logOnKey: await GM.getValue('logOnKey', false),
     logKey: await GM.getValue('logKey', ''),
     rate: await GM.getValue('rate', 10)
 });
-
 const storeSettings = s => Promise.all([
     GM.setValue('fnHooks', s.fnHooks),
     GM.setValue('props', s.props),
     GM.setValue('custom', s.custom),
+    GM.setValue('overrides', s.overrides),
     GM.setValue('logOnKey', s.logOnKey),
     GM.setValue('logKey', s.logKey),
     GM.setValue('rate', s.rate)
 ]);
-
 const useSettings = s => {
     cfg.hooks = s.fnHooks;
     cfg.props = s.props;
     cfg.custom = s.custom;
+    cfg.overrides = s.overrides;
     cfg.logOnKey = s.logOnKey;
     cfg.key = s.logKey;
     cfg.rate = s.rate;
 };
-
 const persist = () => storeSettings({
-    fnHooks: cfg.hooks, props: cfg.props, custom: cfg.custom, logOnKey: cfg.logOnKey, logKey: cfg.key, rate: cfg.rate
+    fnHooks: cfg.hooks, props: cfg.props, custom: cfg.custom, overrides: cfg.overrides, logOnKey: cfg.logOnKey, logKey: cfg.key, rate: cfg.rate
 });
-
 const rebuild = async tab => {
     silent(() => $S('#uh-root')?.remove());
-    panel = propsReady.then(p => buildPanel(p, tab));
+    panel = remoteReady.then(() => buildPanel(tab));
     (await panel).style.display = 'flex';
 };
-
 const commit = async tab => {
     await persist();
     await rebuild(tab);
 };
-
 const unhookAll = () => {
     for(const id of Object.keys(cfg.hooks)) unhook(id);
     for(const name of [...propSlots.keys()]) unhookProp(name);
 };
-
 const hookAll = () => {
     for(const id of Object.keys(cfg.hooks)) hook(id);
     for(const name of Object.keys(cfg.props)) hookProp(name);
 };
-
 const resetAll = async () => {
     unhookAll();
     held = false;
     useSettings(normalize({}));
     await persist();
 };
-
 const exportSettings = async () => {
     const text = JSON.stringify(await loadSettings(), null, 2);
     silent(() => {
@@ -601,7 +675,6 @@ const exportSettings = async () => {
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
 };
-
 const importSettings = async text => {
     const s = silent(() => {
         try{
@@ -619,7 +692,33 @@ const importSettings = async text => {
     hookAll();
     return true;
 };
-
+const dropRemote = async url => {
+    const gone = remote.data[url];
+    remote.urls = remote.urls.filter(u => u !== url);
+    delete remote.data[url];
+    const fnLeft = mergeGroups(silent(catalog), remoteGroups('fnHooks'));
+    const propLeft = Object.values(mergeGroups(PROPS, remoteGroups('props'))).flat();
+    const dropped = new Set();
+    for(const [g, ns] of Object.entries(gone.fnHooks)){
+        for(const n of ns){
+            if(fnLeft[g]?.includes(n)) continue;
+            const id = `${g}.${n}`;
+            unhook(id);
+            delete cfg.hooks[id];
+            dropped.add(`fn:${id}`);
+        }
+    }
+    for(const n of Object.values(gone.props).flat()){
+        if(propLeft.includes(n) || cfg.custom.prop.includes(n)) continue;
+        unhookProp(n);
+        delete cfg.props[n];
+        dropped.add(`prop:${n}`);
+    }
+    cfg.overrides = cfg.overrides.filter(o => !dropped.has(o.key));
+    await persist();
+    await saveRemote();
+    await rebuild(5);
+};
 const buildCustom = (page, baseProps) => {
     let editing = null;
     const flagsOf = type => type === 'fn' ? cfg.hooks : cfg.props;
@@ -627,10 +726,10 @@ const buildCustom = (page, baseProps) => {
     const sharedProp = name => Object.values(baseProps).some(ns => ns.includes(name));
     const typeSel = $C('select');
     typeSel.append(
-        $C('option', { attrs: { value: 'fn' }, props: { textContent: 'Functions (Tab A)' } }),
-        $C('option', { attrs: { value: 'prop' }, props: { textContent: 'Properties (Tab B)' } })
+        $C('option', { attrs: { value: 'fn' }, props: { textContent: 'Functions' } }),
+        $C('option', { attrs: { value: 'prop' }, props: { textContent: 'Properties' } })
     );
-    const nameIn = $C('input', { attrs: { type: 'text', placeholder: 'name' }, styles: { width: '220px' } });
+    const nameIn = $C('input', { attrs: { type: 'text', placeholder: "Add unregistered Fn/Props" }, styles: { width: '260px' } });
     const msg = $C('span', { styles: { color: '#c00' } });
     const clear = () => {
         editing = null;
@@ -655,6 +754,10 @@ const buildCustom = (page, baseProps) => {
         }
         if(/\s/.test(name)){
             msg.textContent = 'Name must not contain spaces.';
+            return;
+        }
+        if(type === 'fn' && !parsePath(name)){
+            msg.textContent = 'Invalid path.';
             return;
         }
         const same = editing && editing.type === type && editing.name === name;
@@ -705,11 +808,126 @@ const buildCustom = (page, baseProps) => {
     }
     page.append(form, rows.length ? tableOf(['Target', 'Name', ''], rows) : 'No custom entries.');
 };
-
-const buildPanel = (baseProps, tab = 0) => silent(() => {
-    const base = Object.fromEntries(Object.entries(baseProps).filter(([g]) => g !== 'Custom'));
-    const cat = { Custom: cfg.custom.fn.slice(), ...catalog() };
-    const propCat = { Custom: cfg.custom.prop.slice(), ...base };
+const targetLabel = key => key.slice(key.indexOf(':') + 1);
+const buildOverride = page => {
+    page.replaceChildren();
+    let editing = -1;
+    const keys = [...new Set([
+        ...Object.keys(cfg.hooks).map(id => `fn:${id}`),
+        ...Object.keys(cfg.props).map(n => `prop:${n}`),
+        ...cfg.overrides.map(o => o.key)
+    ])];
+    const targetSel = $C('select', { styles: { maxWidth: '280px' } });
+    targetSel.append(...keys.map(k => $C('option', { attrs: { value: k }, props: { textContent: targetLabel(k) } })));
+    const phaseSel = $C('select');
+    phaseSel.append(
+        $C('option', { attrs: { value: 'before' }, props: { textContent: 'before call (source, args)' } }),
+        $C('option', { attrs: { value: 'after' }, props: { textContent: 'after call (source, args, result)' } })
+    );
+    const codeIn = $C('textarea', {
+        attrs: { rows: 3, placeholder: 'source.Hp=30   /   args = 100  ' },
+        styles: { width: '100%', boxSizing: 'border-box', font: '12px monospace' }
+    });
+    const msg = $C('span', { styles: { color: '#c00' } });
+    const clear = () => {
+        editing = -1;
+        codeIn.value = '';
+        msg.textContent = '';
+        submitBtn.textContent = 'Add';
+        cancelBtn.style.display = 'none';
+    };
+    const submit = async () => {
+        const key = targetSel.value, code = codeIn.value;
+        if(!key){
+            msg.textContent = 'Enable a hook first.';
+            return;
+        }
+        if(!code.trim()){
+            msg.textContent = 'Code is required.';
+            return;
+        }
+        if(!compile(code)){
+            msg.textContent = 'Syntax error in code.';
+            return;
+        }
+        const entry = { key, phase: phaseSel.value, code };
+        if(editing >= 0) cfg.overrides[editing] = entry; else cfg.overrides.push(entry);
+        await commit(4);
+    };
+    const submitBtn = $C('button', { props: { textContent: 'Add' }, styles: { cursor: 'pointer' }, on: { click: submit } });
+    const cancelBtn = $C('button', { props: { textContent: 'Cancel' }, styles: { cursor: 'pointer', display: 'none' }, on: { click: clear } });
+    const form = $C('div', { styles: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center', marginBottom: '8px' } });
+    form.append(targetSel, phaseSel, submitBtn, cancelBtn, msg);
+    const hint = $C('div', {
+        props: { textContent: 'Variables: source, args (array), result, w. A non-array args is wrapped as [args]. result is applied in the after phase.' },
+        styles: { margin: '4px 0', color: '#555' }
+    });
+    const rows = cfg.overrides.map((o, i) => {
+        const actions = $C('span', { styles: { display: 'flex', gap: '4px' } });
+        actions.append(
+            $C('button', {
+                props: { textContent: 'Edit' },
+                styles: { cursor: 'pointer' },
+                on: {
+                    click: () => {
+                        editing = i;
+                        targetSel.value = o.key;
+                        phaseSel.value = o.phase;
+                        codeIn.value = o.code;
+                        msg.textContent = '';
+                        submitBtn.textContent = 'Save';
+                        cancelBtn.style.display = '';
+                    }
+                }
+            }),
+            $C('button', {
+                props: { textContent: 'Delete' },
+                styles: { cursor: 'pointer' },
+                on: { click: async () => { cfg.overrides.splice(i, 1); await commit(4); } }
+            })
+        );
+        return [targetLabel(o.key), o.phase, $C('span', { props: { textContent: o.code }, styles: { whiteSpace: 'pre-wrap' } }), actions];
+    });
+    page.append(form, codeIn, hint, rows.length ? tableOf(['Target', 'Phase', 'Code', ''], rows) : 'No overrides.');
+};
+const buildManage = page => {
+    const urlIn = $C('input', { attrs: { type: 'text', placeholder: 'https://example.com/hooks.json' }, styles: { width: '420px', maxWidth: '100%' } });
+    const msg = $C('span', { styles: { color: '#c00' } });
+    const count = g => Object.values(g).reduce((t, ns) => t + ns.length, 0);
+    const add = async () => {
+        const url = urlIn.value.trim();
+        if(!/^https?:\/\/\S+$/i.test(url)){
+            msg.textContent = 'Enter a valid http(s) URL.';
+            return;
+        }
+        if(remote.urls.includes(url)){
+            msg.textContent = 'Already listed.';
+            return;
+        }
+        msg.textContent = 'Loading...';
+        const data = normalizeRemote(await fetchJson(url), url);
+        if(!count(data.fnHooks) && !count(data.props)){
+            msg.textContent = 'No valid fnHooks / props found in the JSON.';
+            return;
+        }
+        remote.urls.push(url);
+        remote.data[url] = data;
+        await saveRemote();
+        await rebuild(5);
+    };
+    const form = $C('div', { styles: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center', marginBottom: '8px' } });
+    form.append(urlIn, $C('button', { props: { textContent: 'Add' }, styles: { cursor: 'pointer' }, on: { click: add } }), msg);
+    const rows = remote.urls.map(url => [
+        url,
+        `Functions: ${count(remote.data[url].fnHooks)} / Properties: ${count(remote.data[url].props)}`,
+        $C('button', { props: { textContent: 'Delete' }, styles: { cursor: 'pointer' }, on: { click: () => dropRemote(url) } })
+    ]);
+    page.append(form, rows.length ? tableOf(['URL', 'Names', ''], rows) : 'No JSON URLs.');
+};
+const buildPanel = (tab = 0) => silent(() => {
+    const cat = mergeGroups({ Custom: cfg.custom.fn.slice() }, catalog(), remoteGroups('fnHooks'));
+    const propBase = mergeGroups(PROPS, remoteGroups('props'));
+    const propCat = mergeGroups({ Custom: cfg.custom.prop.slice() }, propBase);
     let current = tab;
     const root = $C('div', {
         attrs: { id: 'uh-root' },
@@ -719,12 +937,9 @@ const buildPanel = (baseProps, tab = 0) => silent(() => {
             font: '13px sans-serif', colorScheme: 'light', boxShadow: '0 8px 32px rgba(0,0,0,.5)'
         }
     });
-    const pageA = $C('div');
-    const pageB = $C('div');
-    const pageC = $C('div');
-    const pageD = $C('div');
-    const pages = [pageA, pageB, pageC, pageD];
-    const buttons = ['Functions', 'Properties', 'Globals', 'Custom'].map((text, i) => $C('button', {
+    const pages = Array.from({ length: 6 }, () => $C('div'));
+    const [pageA, pageB, pageC, pageD, pageE, pageF] = pages;
+    const buttons = ['Functions', 'Properties', 'Globals', 'Custom', 'Override', 'Manage'].map((text, i) => $C('button', {
         props: { textContent: text },
         styles: { cursor: 'pointer' },
         on: { click: () => show(i) }
@@ -736,6 +951,7 @@ const buildPanel = (baseProps, tab = 0) => silent(() => {
             buttons[j].style.fontWeight = i === j ? 'bold' : 'normal';
         });
         if(i === 2) renderGlobals(pageC);
+        if(i === 4) silent(() => buildOverride(pageE));
     };
     const tally = () => {
         buttons[0].textContent = `Functions (${sumChecked(cat, (g, n) => cfg.hooks[`${g}.${n}`])})`;
@@ -759,12 +975,13 @@ const buildPanel = (baseProps, tab = 0) => silent(() => {
             borderBottom: '1px solid #888', background: '#eee'
         }
     });
-    head.append($C('b', { props: { textContent: 'Hook Manager' } }), ...buttons, close);
+    head.append($C('b'), ...buttons, close);
     fillGroups(pageA, cat, cfg.hooks, 'fnHooks', (g, n) => `${g}.${n}`, (id, on) => { if(on) hook(id); else unhook(id); });
     fillGroups(pageB, propCat, cfg.props, 'props', (g, n) => n, (k, on) => { if(on) hookProp(k); else unhookProp(k); });
-    buildCustom(pageD, base);
+    buildCustom(pageD, propBase);
+    buildManage(pageF);
     const body = $C('div', { styles: { overflowY: 'auto', padding: '6px', flex: '1' } });
-    body.append(pageA, pageB, pageC, pageD);
+    body.append(...pages);
     show(tab);
     tally();
     const footer = $C('div', {
@@ -842,6 +1059,7 @@ const buildPanel = (baseProps, tab = 0) => silent(() => {
         styles: { cursor: 'pointer' },
         on: {
             click: async () => {
+                if(!confirm('Reset all hooks, custom entries, overrides and settings?')) return;
                 await resetAll();
                 await rebuild(current);
             }
@@ -854,13 +1072,12 @@ const buildPanel = (baseProps, tab = 0) => silent(() => {
     d.documentElement.appendChild(root);
     return root;
 });
-
+const remoteReady = loadRemote();
 const togglePanel = async () => {
-    panel ??= propsReady.then(buildPanel);
+    panel ??= remoteReady.then(() => buildPanel());
     const el = await panel;
     el.style.display = el.style.display === 'none' ? 'flex' : 'none';
 };
-
 (async () => {
     useSettings(await loadSettings());
     Object.defineProperty(w, '__orig', { value: null, writable: true, configurable: true, enumerable: false });
