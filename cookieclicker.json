@@ -1,4 +1,20 @@
 {
-  "fnHooks": ["Game.Has","Game[\"Has\"]"],
-  "props": ["Game","cookie"]
+  "fn": [
+    "Game.Has","Game[\"Has\"]"
+  ],
+  "prop": [
+    ["Game", "cookie"],["GameS", "cookieS"]
+  ],
+  "Override": [
+    {
+      "key": "fn:Game",
+      "phase": "before",
+      "code": "source = null;"
+    },
+    {
+      "key": "prop:Game",
+      "phase": "before",
+      "code": "console.log(args=10)"
+    }
+  ]
 }
