@@ -2,7 +2,7 @@
 // @name         Web Hook Inspector
 // @name:ja      Web Hook Inspector
 // @namespace    https://github.com/grmpnk
-// @version      0.1.2
+// @version      0.2
 // @description  Hook page functions and properties via checkboxes, and log the source, arguments, result, and stack trace to the console.
 // @description:ja  ページ上の関数・プロパティをチェックボックスで選んでフックし、呼び出し元・引数・戻り値・スタックをコンソールに記録します。
 // @author       grmpneko
@@ -13,7 +13,9 @@
 // @grant        GM.getValue
 // @grant        GM.setValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
 // @connect      raw.githubusercontent.com
+// @connect      *
 // @run-at       document-start
 // @license      MIT
 // ==/UserScript==
@@ -37,7 +39,7 @@ const PREPOP = {
     ],
     Event: ['addEventListener', 'dispatchEvent', 'removeEventListener', 'originalEvent'],
     Dom: [
-        'after', 'attachShadow', 'before', 'prepend', 'ElAppend', 'insertAdjacentHTML', 'setAttribute', 'remove',
+        'after', 'attachShadow', 'before', 'prepend', 'append', 'insertAdjacentHTML', 'setAttribute', 'remove',
         'appendChild', 'cloneNode', 'insertBefore',
         'write', 'querySelector', 'querySelectorAll',
         'createElement'
@@ -54,8 +56,8 @@ const PREPOP = {
         'at', 'concat', 'includes', 'indexOf', 'lastIndexOf', 'slice'
     ],
     Object: [
-        'assign', 'create', 'defineProperties', 'defineProperty', 'ObjEntries', 'freeze', 'preventExtensions', 'setPrototypeOf', 'seal',
-        'PropDescriptor', 'PropDescriptors', 'PropNames', 'PropSymbols', 'fromEntries', 'getPrototypeOf'
+        'assign', 'create', 'defineProperties', 'defineProperty', 'entries', 'freeze', 'preventExtensions', 'setPrototypeOf', 'seal',
+        'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames', 'getOwnPropertySymbols', 'fromEntries', 'getPrototypeOf'
     ],
     Math: [
         'abs', 'acos', 'acosh', 'asin', 'asinh', 'atan', 'atan2', 'atanh', 'cbrt', 'ceil', 'clz32', 'cos', 'cosh', 'exp', 'expm1', 'f16round', 'floor', 'fround', 'hypot', 'imul', 'log',
@@ -67,28 +69,23 @@ const PROPS = {
     login: ['login', 'isLoggedIn', 'isLogin', 'loginStatus', 'loginState', 'loginFlag', 'loginSession'],
     mail: ['email', 'userEmail', 'emailAddress', 'isEmailValid', 'emailValid']
 };
-const ALIAS = new Map([
-    ['XHR', 'XMLHttpRequest'], ['ElAppend', 'append'], ['ObjEntries', 'entries'],
-    ['PropDescriptor', 'getOwnPropertyDescriptor'], ['PropDescriptors', 'getOwnPropertyDescriptors'],
-    ['PropNames', 'getOwnPropertyNames'], ['PropSymbols', 'getOwnPropertySymbols']
-]);
-
+const ALIAS = new Map([['XHR', 'XMLHttpRequest']]);
 const aliased = new Set(ALIAS.values());
 const IFACE = new Set(['HTML', 'Canvas', 'WebGL', 'Interface']);
-const TARGETS = {
-    Dom: () => [w.Element.prototype, w.Node.prototype, w.Document.prototype, w.DocumentFragment.prototype, w.CharacterData.prototype],
-    Event: () => [w.EventTarget.prototype],
-    Arr: () => [w.Array.prototype],
-    Str: () => [w.String.prototype],
-    Object: () => [w.Object],
-    Math: () => [w.Math],
-    Element: () => [w.Element.prototype],
-    Node: () => [w.Node.prototype],
-    Document: () => [w.Document.prototype],
-    Window: () => [w],
-    original: () => [w]
+const TARGET_PATHS = {
+    Dom: [['Element', 'prototype'], ['Node', 'prototype'], ['Document', 'prototype'], ['DocumentFragment', 'prototype'], ['CharacterData', 'prototype']],
+    Event: [['EventTarget', 'prototype']],
+    Arr: [['Array', 'prototype']],
+    Str: [['String', 'prototype']],
+    Object: [['Object']],
+    Math: [['Math']],
+    Element: [['Element', 'prototype']],
+    Node: [['Node', 'prototype']],
+    Document: [['Document', 'prototype']],
+    Window: [[]]
 };
-
+const walkPath = path => path.reduce((o, k) => k === '__proto__' ? Object.getPrototypeOf(o) : o[k], w);
+const fnKey = id => `fn:${id.slice(id.indexOf('.') + 1)}`;
 const dict = () => Object.create(null);
 const cfg = { hooks: dict(), props: dict(), custom: { fn: [], prop: [] }, overrides: [], logOnKey: false, key: '', rate: 10 };
 const slots = new Map();
@@ -97,7 +94,8 @@ const xhrMeta = new WeakMap();
 const remote = { urls: [], data: {} };
 const compiled = new Map();
 const rApply = Reflect.apply, rConstruct = Reflect.construct, fnToString = Function.prototype.toString;
-let held = false, sent = 0, stamp = 0, busy = false, panel = null;
+let held = false, sent = 0, stamp = 0, busy = false, panel = null, remoteOv = [];
+const syncRemoteOv = () => { remoteOv = Object.values(remote.data).flatMap(x => x.overrides ?? []); };
 const silent = fn => {
     const prev = busy;
     busy = true;
@@ -110,34 +108,38 @@ const peek = (o, k) => {
     return s ? s.orig : own(o, k)?.value;
 };
 const fnNames = o => Object.getOwnPropertyNames(o).filter(k => k !== 'constructor' && isFn(peek(o, k)));
-const ownFns = o => fnNames(o).map(key => ({ obj: o, key }));
+const ownFns = (o, path) => fnNames(o).map(key => ({ obj: o, key, path }));
 const isNative = f => /\[native code\]/.test(rApply(fnToString, f, []));
 const tag = (id, key) => id.endsWith(`.${key}`) ? id : `${id} › ${key}`;
 const isCustomEvent = a => {
     const t = typeof a[0] === 'string' ? a[0] : a[0]?.type;
     return typeof t === 'string' && !(`on${t}` in w) && !(`on${t}` in d);
 };
-const members = o => {
+const members = (o, path) => {
     const out = [];
+    let steps = [];
     for(let p = o; p && p !== w.Object.prototype; p = Object.getPrototypeOf(p)){
-        out.push(...ownFns(p));
+        out.push(...ownFns(p, path && [...path, ...steps]));
+        steps = [...steps, '__proto__'];
     }
     return out;
 };
 const iface = name => {
     const c = peek(w, name);
-    return isFn(c) && c.prototype ? ownFns(c.prototype) : [];
+    return isFn(c) && c.prototype ? ownFns(c.prototype, [name, 'prototype']) : [];
 };
 const other = name => {
     const c = peek(w, name);
     if(isFn(c)){
-        const extra = /^[A-Z]/.test(name) && name !== 'Worker' ? [...(c.prototype ? ownFns(c.prototype) : []), ...ownFns(c)] : [];
-        return [{ obj: w, key: name }, ...extra];
+        const extra = /^[A-Z]/.test(name) && name !== 'Worker'
+            ? [...(c.prototype ? ownFns(c.prototype, [name, 'prototype']) : []), ...ownFns(c, [name])]
+            : [];
+        return [{ obj: w, key: name, path: [] }, ...extra];
     }
-    if(isFn(peek(w.Function.prototype, name))) return [{ obj: w.Function.prototype, key: name }];
+    if(isFn(peek(w.Function.prototype, name))) return [{ obj: w.Function.prototype, key: name, path: ['Function', 'prototype'] }];
     let v;
     try{ v = w[name]; }catch{ v = null; }
-    if(v && typeof v === 'object') return members(v);
+    if(v && typeof v === 'object') return members(v, [name]);
     return Object.getOwnPropertyNames(w).filter(k => k.startsWith(name) && isFn(peek(w, k))).flatMap(k => iface(k));
 };
 const parsePath = s => {
@@ -157,8 +159,10 @@ const pathOwner = path => {
         if(o === null || (typeof o !== 'object' && !isFn(o))) return [];
     }
     const key = path[path.length - 1];
+    let steps = [];
     for(let p = o; p && p !== w.Object.prototype; p = Object.getPrototypeOf(p)){
-        if(isFn(peek(p, key))) return [{ obj: p, key }];
+        if(isFn(peek(p, key))) return [{ obj: p, key, path: [...path.slice(0, -1), ...steps] }];
+        steps = [...steps, '__proto__'];
     }
     return [];
 };
@@ -168,12 +172,16 @@ const viaPath = name => {
 };
 const resolve = (group, name) => {
     if(group === 'Event' && name === 'originalEvent'){
-        return ['addEventListener', 'removeEventListener', 'dispatchEvent'].map(key => ({ obj: w.EventTarget.prototype, key, filter: isCustomEvent }));
+        return ['addEventListener', 'removeEventListener', 'dispatchEvent']
+            .map(key => ({ obj: w.EventTarget.prototype, key, path: ['EventTarget', 'prototype'], filter: isCustomEvent }));
     }
     const real = ALIAS.get(name) ?? name;
     if(IFACE.has(group)) return iface(real);
-    if(group === 'other' || !Object.hasOwn(TARGETS, group)) return viaPath(real);
-    return TARGETS[group]().filter(t => isFn(peek(t, real))).map(obj => ({ obj, key: real }));
+    if(group === 'other' || !Object.hasOwn(TARGET_PATHS, group)) return viaPath(real);
+    return TARGET_PATHS[group]
+        .map(path => ({ path, obj: walkPath(path) }))
+        .filter(t => isFn(peek(t.obj, real)))
+        .map(t => ({ obj: t.obj, key: real, path: t.path }));
 };
 const canLog = () => {
     if(cfg.logOnKey && !held) return false;
@@ -233,7 +241,7 @@ const workerSpawn = (info, phase) => {
         return traced(
             () => {
                 const ids = [...slot.ids.keys()];
-                return { label: ids.map(id => tag(id, 'postMessage')).join(' | '), keys: ids.map(id => `fn:${id}`) };
+                return { label: ids.map(id => tag(id, 'postMessage')).join(' | '), keys: ids.map(fnKey) };
             },
             this,
             args,
@@ -256,18 +264,27 @@ const side = (extra, info, phase) => {
 const compile = code => {
     if(!compiled.has(code)){
         let fn = null;
-        try{ fn = new Function('source', 'args', 'result', 'w', `${code}\n;return [source, args, result];`); }catch{ fn = null; }
+        try{ fn = new Function('source', 'args', 'result', 'w', 'console', `${code}\n;return [source, args, result];`); }catch{ fn = null; }
         compiled.set(code, fn);
     }
     return compiled.get(code);
 };
+// Override内のconsole出力も "Max logs / sec" と "Log during keydown key" の対象にする
+const LIMITED = new Set(['log', 'info', 'warn', 'error', 'debug', 'trace', 'dir', 'dirxml', 'table']);
+const limitedConsole = new Proxy(console, {
+    get(t, k){
+        const v = t[k];
+        return isFn(v) ? (...a) => { if(!LIMITED.has(k) || canLog()) return rApply(v, t, a); } : v;
+    }
+});
 const override = (info, phase) => {
-    for(const o of cfg.overrides){
+    const list = remoteOv.length ? cfg.overrides.concat(remoteOv) : cfg.overrides;
+    for(const o of list){
         if(o.phase !== phase || !info.keys.includes(o.key)) continue;
         const fn = compile(o.code);
         if(!fn) continue;
         try{
-            const [source, args, result] = rApply(fn, null, [info.source, info.args, info.result, w]);
+            const [source, args, result] = rApply(fn, null, [info.source, info.args, info.result, w, limitedConsole]);
             if(info.source !== null) info.source = source;
             info.args = Array.isArray(args) ? args : [args];
             if(phase === 'after') info.result = result;
@@ -317,7 +334,7 @@ const traced = (describe, source, args, call, extra) => {
 const invoke = (slot, th, args, nt) => traced(
     a => {
         const ids = [...slot.ids].filter(([, f]) => !f || f(a)).map(([id]) => id);
-        return { label: ids.map(id => tag(id, slot.key)).join(' | '), keys: ids.map(id => `fn:${id}`) };
+        return { label: ids.map(id => tag(id, slot.key)).join(' | '), keys: ids.map(fnKey) };
     },
     nt ? null : th,
     args,
@@ -437,9 +454,13 @@ const cleanFlags = v => {
 const cleanNames = v => Array.isArray(v) ? [...new Set(v.filter(n => typeof n === 'string' && n && !/\s/.test(n)))] : [];
 const cleanOverrides = v => Array.isArray(v)
     ? v.filter(o => isObj(o) && typeof o.key === 'string' && /^(fn|prop):./.test(o.key) && (o.phase === 'before' || o.phase === 'after') && typeof o.code === 'string' && o.code.trim())
-        .map(o => ({ key: o.key, phase: o.phase, code: o.code }))
+        .map(o => ({ key: o.key, phase: o.phase, code: o.code, name: typeof o.name === 'string' ? o.name : '' }))
     : [];
-const groupOf = url => url.split(/[?#]/)[0].split('/').pop().replace(/\.[^.]*$/, '').replace(/\./g, '') || 'json';
+const reserved = new Set([...Object.keys(PREPOP), ...Object.keys(TARGET_PATHS), ...IFACE, 'other', 'Custom', 'Original']);
+const groupOf = url => {
+    const g = url.split(/[?#]/)[0].split('/').pop().replace(/^file:/, '').replace(/\.[^.]*$/, '').replace(/\./g, '') || 'json';
+    return reserved.has(g) ? `${g}_json` : g;
+};
 const cleanGroups = (v, name) => {
     const out = dict();
     const src = Array.isArray(v) ? { [name]: v } : v;
@@ -450,9 +471,14 @@ const cleanGroups = (v, name) => {
     }
     return out;
 };
+// JSON形式: { "fn": [...], "prop": [...], "override": [{ key, phase, code }] }
 const normalizeRemote = (data, url) => {
     const g = groupOf(url);
-    return { fnHooks: cleanGroups(data?.fnHooks, g), props: cleanGroups(data?.props, g) };
+    return {
+        fnHooks: cleanGroups(data?.fn ?? data?.fnHooks, g),
+        props: cleanGroups(data?.prop ?? data?.props, g),
+        overrides: cleanOverrides(data?.override ?? data?.overrides)
+    };
 };
 const mergeGroups = (...srcs) => {
     const out = dict();
@@ -471,6 +497,7 @@ const loadRemote = async () => {
     remote.urls.forEach((u, i) => {
         remote.data[u] = normalizeRemote(fetched[i] ?? (isObj(cached) ? cached[u] : null), u);
     });
+    syncRemoteOv();
     await saveRemote();
 };
 const catalog = () => {
@@ -493,7 +520,7 @@ const catalog = () => {
     for(const n of Object.getOwnPropertyNames(w)){
         const f = peek(w, n);
         if(!isFn(f) || known.has(n) || aliased.has(n)) continue;
-        const g = !isNative(f) ? 'original'
+        const g = !isNative(f) ? 'Original'
 : /^HTML/.test(n) ? 'HTML'
 : /^WebGL/.test(n) ? 'WebGL'
 : /Canvas/.test(n) ? 'Canvas'
@@ -502,6 +529,28 @@ const catalog = () => {
         (found[g] ??= []).push(n);
     }
     for(const [g, names] of Object.entries(found)) extend(g, names);
+    // サイト固有のオブジェクト/関数のメソッドも Original に追加 (例: Game.Has, jQuery.ajax)
+    const site = [];
+    for(const n of Object.getOwnPropertyNames(w)){
+        if(known.has(n) || aliased.has(n) || !/^[^\s.\[\]]+$/.test(n)) continue;
+        const desc = own(w, n);
+        if(!desc || !('value' in desc)) continue;
+        const v = peek(w, n);
+        let list;
+        if(isFn(v)){
+            if(isNative(v)) continue;
+            list = ownFns(v);
+        }else if(v !== null && typeof v === 'object' && !Array.isArray(v) && desc.enumerable){
+            list = members(v);
+        }else{
+            continue;
+        }
+        for(const e of list){
+            if(!/^[^\s.\[\]]+$/.test(e.key) || isNative(peek(e.obj, e.key))) continue;
+            site.push(`${n}.${e.key}`);
+        }
+    }
+    if(site.length) extend('Original', site);
     return cat;
 };
 const sumChecked = (c, pick) => Object.entries(c).reduce((t, [g, ns]) => t + ns.filter(n => pick(g, n)).length, 0);
@@ -598,11 +647,16 @@ const groupBox = (group, names, store, storeName, keyOf, apply, onChange) => {
     refresh();
     return box;
 };
+const renameOriginal = flags => {
+    const out = dict();
+    for(const k of Object.keys(flags)) out[k.startsWith('original.') ? `Original.${k.slice(9)}` : k] = true;
+    return out;
+};
 const normalize = data => {
     const o = isObj(data) ? data : {};
     const c = isObj(o.custom) ? o.custom : {};
     return {
-        fnHooks: cleanFlags(o.fnHooks),
+        fnHooks: renameOriginal(cleanFlags(o.fnHooks)),
         props: cleanFlags(o.props),
         custom: { fn: cleanNames(c.fn), prop: cleanNames(c.prop) },
         overrides: cleanOverrides(o.overrides),
@@ -692,28 +746,32 @@ const importSettings = async text => {
     hookAll();
     return true;
 };
-const dropRemote = async url => {
-    const gone = remote.data[url];
-    remote.urls = remote.urls.filter(u => u !== url);
-    delete remote.data[url];
-    const fnLeft = mergeGroups(silent(catalog), remoteGroups('fnHooks'));
-    const propLeft = Object.values(mergeGroups(PROPS, remoteGroups('props'))).flat();
+const dropRemote = async urls => {
     const dropped = new Set();
-    for(const [g, ns] of Object.entries(gone.fnHooks)){
-        for(const n of ns){
-            if(fnLeft[g]?.includes(n)) continue;
-            const id = `${g}.${n}`;
-            unhook(id);
-            delete cfg.hooks[id];
-            dropped.add(`fn:${id}`);
+    for(const url of urls){
+        const gone = remote.data[url];
+        if(!gone) continue;
+        remote.urls = remote.urls.filter(u => u !== url);
+        delete remote.data[url];
+        const fnLeft = mergeGroups(silent(catalog), remoteGroups('fnHooks'));
+        const propLeft = Object.values(mergeGroups(PROPS, remoteGroups('props'))).flat();
+        for(const [g, ns] of Object.entries(gone.fnHooks)){
+            for(const n of ns){
+                if(fnLeft[g]?.includes(n)) continue;
+                const id = `${g}.${n}`;
+                unhook(id);
+                delete cfg.hooks[id];
+                dropped.add(fnKey(id));
+            }
+        }
+        for(const n of Object.values(gone.props).flat()){
+            if(propLeft.includes(n) || cfg.custom.prop.includes(n)) continue;
+            unhookProp(n);
+            delete cfg.props[n];
+            dropped.add(`prop:${n}`);
         }
     }
-    for(const n of Object.values(gone.props).flat()){
-        if(propLeft.includes(n) || cfg.custom.prop.includes(n)) continue;
-        unhookProp(n);
-        delete cfg.props[n];
-        dropped.add(`prop:${n}`);
-    }
+    syncRemoteOv();
     cfg.overrides = cfg.overrides.filter(o => !dropped.has(o.key));
     await persist();
     await saveRemote();
@@ -809,16 +867,280 @@ const buildCustom = (page, baseProps) => {
     page.append(form, rows.length ? tableOf(['Target', 'Name', ''], rows) : 'No custom entries.');
 };
 const targetLabel = key => key.slice(key.indexOf(':') + 1);
+const typeOf = key => key.startsWith('prop:') ? 'prop' : 'fn';
+
+// ---- Copy用: 他のscriptにそのまま貼れるスニペット生成 ----
+const snippetRuntime = (cfg, run) => {
+    const w = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const rApply = Reflect.apply, rConstruct = Reflect.construct;
+    const isFn = v => typeof v === 'function';
+    const mine = new WeakSet();
+    let busy = false, propDone = false;
+    const apply = (source, args, result) => {
+        busy = true;
+        try{
+            const r = rApply(run, null, [source, args, result, w]);
+            return [r[0], Array.isArray(r[1]) ? r[1] : [r[1]], r[2]];
+        }catch{
+            return [source, args, result];
+        }finally{
+            busy = false;
+        }
+    };
+    const trace = (source, args, call, filter) => {
+        if(busy || (filter && !filter(args))) return call(args, source);
+        let src = source, a = args;
+        if(cfg.phase === 'before'){
+            const r = apply(src, a, undefined);
+            if(src !== null) src = r[0];
+            a = r[1];
+        }
+        let res = call(a, src);
+        if(cfg.phase === 'after') res = apply(src, a, res)[2];
+        return res;
+    };
+    const isCustomEvent = a => {
+        const t = typeof a[0] === 'string' ? a[0] : a[0]?.type;
+        return typeof t === 'string' && !('on' + t in w) && !('on' + t in document);
+    };
+    const walk = path => {
+        let o = w;
+        for(const k of path){
+            try{ o = k === '__proto__' ? Object.getPrototypeOf(o) : o[k]; }catch{ return null; }
+            if(o === null || o === undefined) return null;
+        }
+        return o;
+    };
+    const install = (obj, key, filter) => {
+        const desc = Object.getOwnPropertyDescriptor(obj, key);
+        if(!desc || !isFn(desc.value) || mine.has(desc.value)) return;
+        const orig = desc.value;
+        const proxy = new Proxy(orig, {
+            apply: (t, th, a) => trace(th, a, (x, s) => rApply(orig, s, x), filter),
+            construct: (t, a, nt) => trace(null, a, x => rConstruct(orig, x, nt), filter)
+        });
+        mine.add(proxy);
+        try{ Object.defineProperty(obj, key, { ...desc, value: proxy }); }catch{}
+    };
+    const hookFn = () => {
+        for(const s of cfg.specs){
+            const base = walk(s.path);
+            if(base === null) continue;
+            for(const key of s.keys){
+                if(!s.chain){ install(base, key, s.custom ? isCustomEvent : null); continue; }
+                for(let p = base; p && p !== w.Object.prototype; p = Object.getPrototypeOf(p)){
+                    if(isFn(Object.getOwnPropertyDescriptor(p, key)?.value)){ install(p, key, null); break; }
+                }
+            }
+        }
+    };
+    const hookProp = () => {
+        if(propDone) return;
+        propDone = true;
+        const name = cfg.name;
+        for(const obj of [w, w.Object.prototype, w.Array.prototype, w.Function.prototype]){
+            const prev = Object.getOwnPropertyDescriptor(obj, name);
+            if(prev && !prev.configurable) continue;
+            const values = new WeakMap();
+            const keyOf = t => (t !== null && (typeof t === 'object' || isFn(t))) ? t : obj;
+            try{
+                Object.defineProperty(obj, name, {
+                    configurable: true, enumerable: false,
+                    get(){
+                        const k = keyOf(this);
+                        return trace(this, [], (a, s) => {
+                            if(values.has(k)) return values.get(k);
+                            if(!prev) return undefined;
+                            return prev.get ? rApply(prev.get, s, []) : prev.value;
+                        });
+                    },
+                    set(v){
+                        const k = keyOf(this);
+                        trace(this, [v], (a, s) => {
+                            if(prev?.set && !values.has(k)) return rApply(prev.set, s, a);
+                            values.set(k, a[0]);
+                        });
+                    }
+                });
+            }catch{}
+        }
+    };
+    if(cfg.type === 'fn') hookFn(); else hookProp();
+};
+const fnIds = key => {
+    const on = Object.keys(cfg.hooks).filter(id => fnKey(id) === key);
+    if(on.length) return on;
+    const cat = mergeGroups({ Custom: cfg.custom.fn.slice() }, catalog(), remoteGroups('fnHooks'));
+    const found = Object.entries(cat).flatMap(([g, ns]) => ns.filter(n => `fn:${n}` === key).map(n => `${g}.${n}`));
+    return found.length ? found : [`Custom.${key.slice(3)}`];
+};
+const fnSpecs = key => silent(() => {
+    const out = new Map();
+    const add = (path, k, chain, custom) => {
+        const id = JSON.stringify([path, chain, custom]);
+        if(!out.has(id)) out.set(id, { path, keys: [], chain, custom });
+        const s = out.get(id);
+        if(!s.keys.includes(k)) s.keys.push(k);
+    };
+    for(const id of fnIds(key)){
+        const i = id.indexOf('.'), group = id.slice(0, i), name = id.slice(i + 1);
+        const path = parsePath(ALIAS.get(name) ?? name);
+        const viaP = !IFACE.has(group) && (group === 'other' || !Object.hasOwn(TARGET_PATHS, group)) && path && path.length > 1;
+        if(viaP){ add(path.slice(0, -1), path[path.length - 1], true, false); continue; }
+        for(const e of resolve(group, name)){
+            if(e.path) add(e.path, e.key, false, !!e.filter);
+        }
+    }
+    return [...out.values()];
+});
+const snippetHead = `// Required in the destination script's meta block:\n// @run-at      document-start\n// @grant       unsafeWindow\n`;
+const snippetOf = list => {
+    const parts = [];
+    for(const o of list){
+        if(!compile(o.code)) continue;
+        const isProp = o.key.startsWith('prop:');
+        const conf = isProp
+            ? { type: 'prop', phase: o.phase, name: targetLabel(o.key) }
+            : { type: 'fn', phase: o.phase, specs: fnSpecs(o.key) };
+        if(!isProp && !conf.specs.length) continue;
+        parts.push(`// ${o.key} (${o.phase})\n__hook(${JSON.stringify(conf)}, function(source, args, result, w){\n${o.code}\n;return [source, args, result];\n});\n`);
+    }
+    if(!parts.length) return null;
+    return { ok: parts.length, text: `${snippetHead}// Web Hook Inspector\n{\nconst __hook = ${rApply(fnToString, snippetRuntime, [])};\n${parts.join('')}}\n` };
+};
+const makeSnippet = o => snippetOf([o])?.text ?? null;
+const copyText = async text => {
+    try{
+        if(typeof GM_setClipboard === 'function'){ GM_setClipboard(text, 'text'); return true; }
+    }catch{}
+    try{ await navigator.clipboard.writeText(text); return true; }catch{}
+    return silent(() => {
+        const ta = $C('textarea', { props: { value: text }, styles: { position: 'fixed', opacity: '0' } });
+        d.documentElement.appendChild(ta);
+        ta.select();
+        let ok = false;
+        try{ ok = document.execCommand('copy'); }catch{}
+        ta.remove();
+        return ok;
+    });
+};
+const copyBtn = o => {
+    const b = $C('button', { props: { textContent: 'Copy' }, styles: { cursor: 'pointer' } });
+    b.addEventListener('click', async () => {
+        const text = makeSnippet(o);
+        b.textContent = text && await copyText(text) ? 'Copied' : 'Failed';
+        setTimeout(() => { b.textContent = 'Copy'; }, 1200);
+    });
+    return b;
+};
+
+// 同じ(obj,key)を二重にHookしないよう、候補idを絞る
+const pickIds = key => {
+    const seen = new Map(), out = [];
+    for(const id of fnIds(key)){
+        const i = id.indexOf('.');
+        const es = silent(() => resolve(id.slice(0, i), id.slice(i + 1)));
+        if(es.length && es.every(e => seen.get(e.obj)?.has(e.key))) continue;
+        for(const e of es){
+            if(!seen.has(e.obj)) seen.set(e.obj, new Set());
+            seen.get(e.obj).add(e.key);
+        }
+        out.push(id);
+    }
+    return out;
+};
+const targetEnabled = key => key.startsWith('prop:')
+    ? !!cfg.props[targetLabel(key)]
+    : Object.keys(cfg.hooks).some(id => fnKey(id) === key);
+// TargetのHook/unHookだけを行う (Overrideの有効/無効には触れない)
+const setTarget = async (key, on) => {
+    if(key.startsWith('prop:')){
+        const n = targetLabel(key);
+        if(on){
+            const known = Object.values(mergeGroups(PROPS, remoteGroups('props'))).flat();
+            if(!known.includes(n) && !cfg.custom.prop.includes(n)) cfg.custom.prop.push(n);
+            cfg.props[n] = true;
+            hookProp(n);
+        }else{
+            delete cfg.props[n];
+            unhookProp(n);
+        }
+    }else if(on){
+        for(const id of pickIds(key)){
+            const name = id.slice(id.indexOf('.') + 1);
+            if(id.startsWith('Custom.') && !cfg.custom.fn.includes(name)) cfg.custom.fn.push(name);
+            cfg.hooks[id] = true;
+            hook(id);
+        }
+    }else{
+        for(const id of Object.keys(cfg.hooks).filter(id => fnKey(id) === key)){
+            unhook(id);
+            delete cfg.hooks[id];
+        }
+    }
+    await persist();
+};
+const allOverrides = () => [...cfg.overrides, ...remote.urls.flatMap(u => remote.data[u].overrides)];
+const overrideJson = list => {
+    const fn = [], prop = [];
+    for(const o of list){
+        const arr = typeOf(o.key) === 'prop' ? prop : fn;
+        const n = targetLabel(o.key);
+        if(!arr.includes(n)) arr.push(n);
+    }
+    const out = {};
+    if(fn.length) out.fn = fn;
+    if(prop.length) out.prop = prop;
+    out.override = list.map(o => ({ key: o.key, phase: o.phase, code: o.code, name: o.name ?? '' }));
+    return JSON.stringify(out, null, 2);
+};
+const downloadText = (name, text) => silent(() => {
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    const a = $C('a', { attrs: { href: url, download: name } });
+    d.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+const flash = (b, label, text) => {
+    b.textContent = text;
+    setTimeout(() => { b.textContent = label; }, 1500);
+};
+const jsonBtn = o => $C('button', {
+    props: { textContent: 'JSON' },
+    attrs: { title: 'Save this override as JSON' },
+    styles: { cursor: 'pointer' },
+    on: { click: () => downloadText(`override-${(o.name || targetLabel(o.key)).replace(/[^\w.-]+/g, '_')}.json`, overrideJson([o])) }
+});
+const copyAllBtn = () => {
+    const b = $C('button', { props: { textContent: 'Copy All' }, attrs: { title: 'Copy a snippet that hooks every target and applies every override' }, styles: { cursor: 'pointer' } });
+    b.addEventListener('click', async () => {
+        const list = allOverrides();
+        const r = snippetOf(list);
+        flash(b, 'Copy All', r && await copyText(r.text) ? `Copied ${r.ok}/${list.length}` : 'Failed');
+    });
+    return b;
+};
+const jsonAllBtn = () => {
+    const b = $C('button', { props: { textContent: 'JSON All' }, attrs: { title: 'Save all overrides as JSON' }, styles: { cursor: 'pointer' } });
+    b.addEventListener('click', () => {
+        const list = allOverrides();
+        if(!list.length){ flash(b, 'JSON All', 'Empty'); return; }
+        downloadText('web-hook-inspector-overrides.json', overrideJson(list));
+    });
+    return b;
+};
 const buildOverride = page => {
     page.replaceChildren();
     let editing = -1;
     const keys = [...new Set([
-        ...Object.keys(cfg.hooks).map(id => `fn:${id}`),
+        ...Object.keys(cfg.hooks).map(fnKey),
         ...Object.keys(cfg.props).map(n => `prop:${n}`),
         ...cfg.overrides.map(o => o.key)
     ])];
+    const nameIn = $C('input', { attrs: { type: 'text', placeholder: 'Name' }, styles: { width: '160px' } });
     const targetSel = $C('select', { styles: { maxWidth: '280px' } });
-    targetSel.append(...keys.map(k => $C('option', { attrs: { value: k }, props: { textContent: targetLabel(k) } })));
+    targetSel.append(...keys.map(k => $C('option', { attrs: { value: k }, props: { textContent: `${typeOf(k)}: ${targetLabel(k)}` } })));
     const phaseSel = $C('select');
     phaseSel.append(
         $C('option', { attrs: { value: 'before' }, props: { textContent: 'before call (source, args)' } }),
@@ -831,6 +1153,7 @@ const buildOverride = page => {
     const msg = $C('span', { styles: { color: '#c00' } });
     const clear = () => {
         editing = -1;
+        nameIn.value = '';
         codeIn.value = '';
         msg.textContent = '';
         submitBtn.textContent = 'Add';
@@ -850,18 +1173,33 @@ const buildOverride = page => {
             msg.textContent = 'Syntax error in code.';
             return;
         }
-        const entry = { key, phase: phaseSel.value, code };
+        const entry = { key, phase: phaseSel.value, code, name: nameIn.value.trim() };
         if(editing >= 0) cfg.overrides[editing] = entry; else cfg.overrides.push(entry);
         await commit(4);
     };
     const submitBtn = $C('button', { props: { textContent: 'Add' }, styles: { cursor: 'pointer' }, on: { click: submit } });
     const cancelBtn = $C('button', { props: { textContent: 'Cancel' }, styles: { cursor: 'pointer', display: 'none' }, on: { click: clear } });
     const form = $C('div', { styles: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center', marginBottom: '8px' } });
-    form.append(targetSel, phaseSel, submitBtn, cancelBtn, msg);
+    form.append(nameIn, targetSel, phaseSel, submitBtn, cancelBtn, msg);
     const hint = $C('div', {
-        props: { textContent: 'Variables: source, args (array), result, w. A non-array args is wrapped as [args]. result is applied in the after phase.' },
+        props: { textContent: 'Variables: source, args (array), result. A non-array args is wrapped as [args]. result is applied in the after phase. Copy: copies a standalone snippet (hook + override) for new scripts. It hooks immediately, so the target script needs // @run-at document-start and // @grant unsafeWindow.' },
         styles: { margin: '4px 0', color: '#555' }
     });
+    const byKey = new Map();
+    const targetCell = (key, text) => {
+        const cb = $C('input', { attrs: { type: 'checkbox', title: 'Hook / unhook this target' }, props: { checked: targetEnabled(key) } });
+        if(!byKey.has(key)) byKey.set(key, []);
+        byKey.get(key).push(cb);
+        cb.addEventListener('change', async () => {
+            await setTarget(key, cb.checked);
+            const on = targetEnabled(key);
+            for(const c of byKey.get(key)) c.checked = on;
+        });
+        const label = $C('label', { styles: { cursor: 'pointer' } });
+        label.append(cb, ` ${text}`);
+        return label;
+    };
+    const codeCell = o => $C('span', { props: { textContent: o.code }, styles: { whiteSpace: 'pre-wrap' } });
     const rows = cfg.overrides.map((o, i) => {
         const actions = $C('span', { styles: { display: 'flex', gap: '4px' } });
         actions.append(
@@ -871,6 +1209,7 @@ const buildOverride = page => {
                 on: {
                     click: () => {
                         editing = i;
+                        nameIn.value = o.name || '';
                         targetSel.value = o.key;
                         phaseSel.value = o.phase;
                         codeIn.value = o.code;
@@ -884,18 +1223,60 @@ const buildOverride = page => {
                 props: { textContent: 'Delete' },
                 styles: { cursor: 'pointer' },
                 on: { click: async () => { cfg.overrides.splice(i, 1); await commit(4); } }
-            })
+            }),
+            copyBtn(o),
+            jsonBtn(o)
         );
-        return [targetLabel(o.key), o.phase, $C('span', { props: { textContent: o.code }, styles: { whiteSpace: 'pre-wrap' } }), actions];
+        return [typeOf(o.key), o.name || '', targetCell(o.key, targetLabel(o.key)), o.phase, codeCell(o), actions];
     });
-    page.append(form, codeIn, hint, rows.length ? tableOf(['Target', 'Phase', 'Code', ''], rows) : 'No overrides.');
+    // Manageタブで追加したJSON由来のOverride (編集・削除はManageタブから)
+    for(const url of remote.urls){
+        for(const o of remote.data[url].overrides){
+            const actions = $C('span', { styles: { display: 'flex', gap: '4px' } });
+            actions.append(copyBtn(o), jsonBtn(o));
+            rows.push([typeOf(o.key), o.name || '', targetCell(o.key, `${targetLabel(o.key)} (${groupOf(url)})`), o.phase, codeCell(o), actions]);
+        }
+    }
+    const bar = $C('div', { styles: { display: 'flex', gap: '8px', marginBottom: '8px' } });
+    bar.append(copyAllBtn(), jsonAllBtn());
+    page.append(bar, form, codeIn, hint, rows.length ? tableOf(['Type', 'Name', 'Target', 'Phase', 'Code', ''], rows) : 'No overrides.');
 };
+let manageNote = '';
 const buildManage = page => {
+    const selected = new Set();
     const urlIn = $C('input', { attrs: { type: 'text', placeholder: 'https://example.com/hooks.json' }, styles: { width: '420px', maxWidth: '100%' } });
-    const msg = $C('span', { styles: { color: '#c00' } });
+    const msg = $C('span', { styles: { color: '#c00' }, props: { textContent: manageNote } });
+    manageNote = '';
     const count = g => Object.values(g).reduce((t, ns) => t + ns.length, 0);
+    // github.com/.../blob/... は raw.githubusercontent.com に変換
+    const toRaw = u => u.replace(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/(.+)$/i, 'https://raw.githubusercontent.com/$1/$2/$3');
+    // 追加できたらtrue。失敗時は理由をnotesに積む
+    const register = (key, raw, notes) => {
+        if(raw === null){
+            notes.push(`${key}: failed to load JSON`);
+            return false;
+        }
+        const data = normalizeRemote(raw, key);
+        if(!count(data.fnHooks) && !count(data.props) && !data.overrides.length){
+            notes.push(`${key}: no valid fn / prop / override found`);
+            return false;
+        }
+        remote.urls.push(key);
+        remote.data[key] = data;
+        return true;
+    };
+    const finish = async (added, notes) => {
+        if(added){
+            syncRemoteOv();
+            await saveRemote();
+            manageNote = notes.join(' / ');
+            await rebuild(5);
+        }else{
+            msg.textContent = notes.join(' / ');
+        }
+    };
     const add = async () => {
-        const url = urlIn.value.trim();
+        const url = toRaw(urlIn.value.trim());
         if(!/^https?:\/\/\S+$/i.test(url)){
             msg.textContent = 'Enter a valid http(s) URL.';
             return;
@@ -905,27 +1286,145 @@ const buildManage = page => {
             return;
         }
         msg.textContent = 'Loading...';
-        const data = normalizeRemote(await fetchJson(url), url);
-        if(!count(data.fnHooks) && !count(data.props)){
-            msg.textContent = 'No valid fnHooks / props found in the JSON.';
+        const notes = [];
+        await finish(register(url, await fetchJson(url), notes), notes);
+    };
+    const addFiles = async files => {
+        const notes = [];
+        let added = false;
+        for(const file of files){
+            const key = `file:${file.name}`;
+            if(remote.urls.includes(key)){
+                notes.push(`${file.name}: already listed`);
+                continue;
+            }
+            let raw = null;
+            try{ raw = JSON.parse(await file.text()); }catch{ raw = null; }
+            if(register(key, raw, notes)) added = true;
+        }
+        await finish(added, notes);
+    };
+    const fileIn = $C('input', {
+        attrs: { type: 'file', accept: '.json,application/json', multiple: true },
+        styles: { display: 'none' },
+        on: {
+            change: async () => {
+                const files = [...fileIn.files];
+                fileIn.value = '';
+                if(files.length) await addFiles(files);
+            }
+        }
+    });
+    const drop = $C('div', {
+        props: { textContent: 'Drop JSON files here (or click to select)' },
+        styles: { border: '2px dashed #888', borderRadius: '6px', padding: '14px', textAlign: 'center', color: '#555', cursor: 'pointer', marginBottom: '8px'},
+        on: {
+            click: () => fileIn.click(),
+            dragover: e => { e.preventDefault(); e.stopPropagation(); drop.style.background = '#e8f4ff'; },
+            dragleave: () => { drop.style.background = ''; },
+            drop: async e => {
+                e.preventDefault();
+                e.stopPropagation();
+                drop.style.background = '';
+                const files = [...(e.dataTransfer?.files ?? [])];
+                if(files.length) await addFiles(files);
+            }
+        }
+    });
+    const delSelected = async () => {
+        if(!selected.size){
+            msg.textContent = 'Select entries to delete.';
             return;
         }
-        remote.urls.push(url);
-        remote.data[url] = data;
-        await saveRemote();
-        await rebuild(5);
+        await dropRemote([...selected]);
     };
     const form = $C('div', { styles: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center', marginBottom: '8px' } });
-    form.append(urlIn, $C('button', { props: { textContent: 'Add' }, styles: { cursor: 'pointer' }, on: { click: add } }), msg);
-    const rows = remote.urls.map(url => [
-        url,
-        `Functions: ${count(remote.data[url].fnHooks)} / Properties: ${count(remote.data[url].props)}`,
-        $C('button', { props: { textContent: 'Delete' }, styles: { cursor: 'pointer' }, on: { click: () => dropRemote(url) } })
-    ]);
-    page.append(form, rows.length ? tableOf(['URL', 'Names', ''], rows) : 'No JSON URLs.');
+    form.append(
+        urlIn,
+        $C('button', { props: { textContent: 'Add URL' }, styles: { cursor: 'pointer' }, on: { click: add } }),
+        $C('button', { props: { textContent: 'Delete selected' }, styles: { cursor: 'pointer' }, on: { click: delSelected } }),
+        msg, fileIn
+    );
+    const hint = $C('div', {
+        props: { textContent: '{ "fn": ["Game","item"], "prop": ["cookies"], "override": [{ "key": "prop:cookies", "phase": "before", "code": "args=10000", "name": "CookieAmount" }] }    “fn” will be added to “Functions,”“prop”to“Properties,”and override’to“Overrides.”' },
+        styles: { margin: '4px 0 8px', color: '#555', font: '12px monospace', wordBreak: 'break-all' }
+    });
+    const boxes = [];
+    const rows = remote.urls.map(url => {
+        const cb = $C('input', {
+            attrs: { type: 'checkbox' },
+            on: { change: () => { if(cb.checked) selected.add(url); else selected.delete(url); } }
+        });
+        boxes.push(cb);
+        return [
+            cb, url,
+            `Functions: ${count(remote.data[url].fnHooks)} / Properties: ${count(remote.data[url].props)} / Overrides: ${remote.data[url].overrides.length}`
+        ];
+    });
+    const all = $C('input', {
+        attrs: { type: 'checkbox', title: 'Select all' },
+        on: {
+            change: () => {
+                boxes.forEach((cb, i) => {
+                    cb.checked = all.checked;
+                    if(all.checked) selected.add(remote.urls[i]); else selected.delete(remote.urls[i]);
+                });
+            }
+        }
+    });
+    page.append(drop, form, hint, rows.length ? tableOf([all, 'URL / File', 'Names'], rows) : 'No JSON URLs.');
+};
+const buildOptions = page => {
+    const note = $C('span', { styles: { color: '#555' } });
+    const row = (label, run) => {
+        const line = $C('div', { styles: { display: 'flex', alignItems: 'center', gap: '8px', margin: '8px 0' } });
+        line.append($C('button', { props: { textContent: label }, styles: { cursor: 'pointer' }, on: { click: run } }));
+        return line;
+    };
+    const clearFns = async () => {
+        const n = Object.keys(cfg.hooks).length;
+        if(!confirm(`Delete saved Functions data (${n} checked)? Hooks will be removed.`)) return;
+        for(const id of Object.keys(cfg.hooks)) unhook(id);
+        cfg.hooks = dict();
+        await persist();
+        await rebuild(6);
+    };
+    const clearProps = async () => {
+        const n = Object.keys(cfg.props).length;
+        if(!confirm(`Delete saved Properties data (${n} checked)? Hooks will be removed.`)) return;
+        for(const name of Object.keys(cfg.props)) unhookProp(name);
+        cfg.props = dict();
+        await persist();
+        await rebuild(6);
+    };
+    page.append(
+        row(`Delete saved Functions data (${Object.keys(cfg.hooks).length})`, clearFns),
+        row(`Delete saved Properties data (${Object.keys(cfg.props).length})`, clearProps),
+        note
+    );
+};
+// 保存データを読み直して(他のタブ/ページでの変更も反映)、指定タブで再構築する
+const reloadSaved = async () => {
+    const s = await loadSettings();
+    for(const id of Object.keys(cfg.hooks)) if(!s.fnHooks[id]) unhook(id);
+    for(const n of Object.keys(cfg.props)) if(!s.props[n]) unhookProp(n);
+    useSettings(s);
+    hookAll();
+    const urls = await GM.getValue('jsonUrls', null);
+    const cached = await GM.getValue('jsonData', {});
+    if(Array.isArray(urls)){
+        remote.urls = [...new Set(urls.filter(u => typeof u === 'string' && u))];
+        remote.data = {};
+        remote.urls.forEach(u => { remote.data[u] = normalizeRemote(isObj(cached) ? cached[u] : null, u); });
+        syncRemoteOv();
+    }
+};
+const refreshTab = async i => {
+    await reloadSaved();
+    await rebuild(i);
 };
 const buildPanel = (tab = 0) => silent(() => {
-    const cat = mergeGroups({ Custom: cfg.custom.fn.slice() }, catalog(), remoteGroups('fnHooks'));
+    const cat = mergeGroups({ Custom: cfg.custom.fn.slice(), Original: [] }, catalog(), remoteGroups('fnHooks'));
     const propBase = mergeGroups(PROPS, remoteGroups('props'));
     const propCat = mergeGroups({ Custom: cfg.custom.prop.slice() }, propBase);
     let current = tab;
@@ -937,12 +1436,12 @@ const buildPanel = (tab = 0) => silent(() => {
             font: '13px sans-serif', colorScheme: 'light', boxShadow: '0 8px 32px rgba(0,0,0,.5)'
         }
     });
-    const pages = Array.from({ length: 6 }, () => $C('div'));
-    const [pageA, pageB, pageC, pageD, pageE, pageF] = pages;
-    const buttons = ['Functions', 'Properties', 'Globals', 'Custom', 'Override', 'Manage'].map((text, i) => $C('button', {
+    const pages = Array.from({ length: 7 }, () => $C('div'));
+    const [pageA, pageB, pageC, pageD, pageE, pageF, pageG] = pages;
+    const buttons = ['Functions', 'Properties', 'Globals', 'Custom', 'Overrides', 'Manage', 'Options'].map((text, i) => $C('button', {
         props: { textContent: text },
         styles: { cursor: 'pointer' },
-        on: { click: () => show(i) }
+        on: { click: () => refreshTab(i) }
     }));
     const show = i => {
         current = i;
@@ -980,6 +1479,7 @@ const buildPanel = (tab = 0) => silent(() => {
     fillGroups(pageB, propCat, cfg.props, 'props', (g, n) => n, (k, on) => { if(on) hookProp(k); else unhookProp(k); });
     buildCustom(pageD, propBase);
     buildManage(pageF);
+    buildOptions(pageG);
     const body = $C('div', { styles: { overflowY: 'auto', padding: '6px', flex: '1' } });
     body.append(...pages);
     show(tab);
