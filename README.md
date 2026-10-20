@@ -12,15 +12,55 @@
 
 <h2>Features</h2>
 
-<ul>
-  <li><code>Functions Tab</code></li>
-  <li><code>Properties Tab</code></li>
-  <li><code>Globals Tab</code></li>
-  <li><code>Custom Tab</code></li>
-  <li><code>Overrides Tab</code></li>
-  <li><code>Manage Tab</code></li>
-  <li><code>Options Tab</code></li>
-</ul>
+<ol>
+  <li>Functions Tab
+    <ul>
+      <li>Hooks all functions on the <code>window object</code></li>
+      <li><b>Original</b> shows site-specific functions.</li>
+    </ul>
+  </li>
+
+  <li>Properties Tab
+    <ul>
+      <li>Hooks all properties inherited from <code>window</code>, <code>Object.prototype</code>, <code>Array.prototype</code>, and <code>Function.prototype</code>.</li>
+    </ul>
+  </li>
+
+  <li>Globals Tab
+    <ul>
+      <li>Displays all variables, objects, and arrays in the <code>window object.</code></li>
+      <li>When you click a name in the table, that action is logged in the DevTools console.</li>
+    </ul>
+  </li>
+
+  <li>Custom Tab
+    <ul>
+      <li>allows you to add your own entries to the <code>Functions</code> and <code>Properties</code> tabs.</li>
+    </ul>
+  </li>
+
+  <li>Overrides Tab
+    <ul>
+      <li>Allows you to override hooked <code>functions</code> and <code>properties</code>.</li>
+      <li><code>Copy Button:</code> Copies the hook and override code as a ready-to-use snippet. Simply paste it into a new userscript and run it. If the target has not been hooked successfully, the operation will fail.</li>
+      <li><code>JSON Button:</code> Saves the selected overrides as a JSON file.</li>
+    </ul>
+  </li>
+
+  <li>Manage Tab
+    <ul>
+      <li>Manage JSON files. “fn” will be added to “Functions,” “prop” to “Properties,” and “override” to “Overrides.”</li>
+    </ul>
+  </li>
+
+  <li>Fotter
+    <ul>
+      <li><code>Export Button:</code> Saves all stored values as a JSON file.</li>
+    </ul>
+  </li>
+</ol>
+
+<br>
 
 <h2>Installation</h2>
 
